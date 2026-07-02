@@ -10,10 +10,9 @@ permissions:
 
 jobs:
   build:
-    uses: ./.github/workflows/_shared-build.yaml
+    uses: ./.github/workflows/_shared-build.yml
     with:
       ref: ${{ github.sha }}
       tags: '["main","unstable"]'
     secrets:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
