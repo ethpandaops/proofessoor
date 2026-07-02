@@ -19,7 +19,7 @@ on:
       DOCKERHUB_TOKEN:
         required: true
 
-# Image repo is the `DOCKER_REPOSITORY` repo variable, e.g. "myorg/proofessoor".
+# Image repo defaults to the GitHub repo name; set the DOCKER_REPOSITORY var to override.
 permissions:
   contents: read
 
@@ -94,7 +94,7 @@ jobs:
           context: ctx
           file: Dockerfile.release
           platforms: linux/${{ matrix.arch }}
-          outputs: type=image,name=${{ vars.DOCKER_REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ vars.DOCKER_REPOSITORY || github.repository }},push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -126,7 +126,7 @@ jobs:
       - name: Create and push manifest
         working-directory: ${{ runner.temp }}/digests
         env:
-          IMAGE: ${{ vars.DOCKER_REPOSITORY }}
+          IMAGE: ${{ vars.DOCKER_REPOSITORY || github.repository }}
           TAGS: ${{ inputs.tags }}
         run: |
           tag_args=$(echo "$TAGS" | jq -r --arg img "$IMAGE" '.[] | "-t " + $img + ":" + .')
@@ -136,7 +136,7 @@ jobs:
             $(printf "${IMAGE}@sha256:%s " *)
       - name: Inspect and capture the manifest digest
         env:
-          IMAGE: ${{ vars.DOCKER_REPOSITORY }}
+          IMAGE: ${{ vars.DOCKER_REPOSITORY || github.repository }}
           TAGS: ${{ inputs.tags }}
         run: |
           first=$(echo "$TAGS" | jq -r '.[0]')
