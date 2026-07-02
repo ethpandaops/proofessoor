@@ -100,7 +100,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Retag the existing digest as the release
         env:
-          IMAGE: ${{ vars.DOCKER_REPOSITORY }}
+          IMAGE: ${{ vars.DOCKER_REPOSITORY || github.repository }}
           TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
           digest=$(cat digest/digest.txt)
