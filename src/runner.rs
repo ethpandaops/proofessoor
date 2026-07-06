@@ -1,10 +1,11 @@
 //! Stream-mode orchestration.
 //!
 //! Consumes the Beacon API block event stream and, for each new non-optimistic
-//! block, builds and submits a proof request — fire-and-forget, so submission
-//! keeps pace with block arrival. A separate watcher task observes zkBoost's
-//! proof events, records each outcome in the status registry, and optionally
-//! downloads/verifies completed proofs. The daemon stops on SIGINT/SIGTERM.
+//! block, builds and submits a proof request under bounded concurrency, so
+//! submission keeps pace with block arrival. A separate watcher task observes
+//! zkBoost's proof events, records each proof's outcome in the status registry,
+//! and optionally downloads/verifies completed proofs. The daemon stops on
+//! SIGINT/SIGTERM.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,14 +36,16 @@ use crate::zkboost::{self, ProofEvent};
 /// Delay before reconnecting after an event stream drops.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
-/// Stream persists one outcome per block, so it cannot represent distinct
-/// results for several proof types on the same block. Restrict stream mode to a
-/// single proof type until status is tracked per proof; `request` handles many.
+/// The status model tracks proofs per type, but stream mode is restricted to a
+/// single proof type: multi-proof streaming has not been exercised end to end
+/// (dashboard aggregation, per-type failure display), and proving several
+/// types per block multiplies prover cost. The one-shot `request` command
+/// accepts multiple types.
 fn ensure_single_proof_type(count: usize) -> Result<()> {
     anyhow::ensure!(
         count == 1,
-        "stream mode supports exactly one proof type (got {count}); multi-proof \
-         stream status needs per-proof tracking — use `request` for multiple"
+        "stream mode supports exactly one proof type (got {count}); \
+         use `request` for multiple"
     );
     Ok(())
 }
@@ -249,6 +252,7 @@ async fn process_block(
                 .record(failed_record(
                     &fetched,
                     payload_request.block_number(),
+                    payload_request.block_hash().to_string(),
                     root_hex.clone(),
                     proof_types,
                     observed_at_ms,
@@ -271,6 +275,7 @@ async fn process_block(
             .record(failed_record(
                 &fetched,
                 payload_request.block_number(),
+                payload_request.block_hash().to_string(),
                 root_hex.clone(),
                 proof_types,
                 observed_at_ms,
@@ -298,6 +303,7 @@ async fn process_block(
             fetched.slot(),
             fetched.root().to_string(),
             payload_request.block_number(),
+            payload_request.block_hash().to_string(),
             root_hex,
             proof_types.iter().map(|p| p.as_str().to_string()).collect(),
             observed_at_ms,
@@ -320,6 +326,7 @@ async fn process_block(
 fn failed_record(
     fetched: &beacon::FetchedBlock,
     block_number: u64,
+    block_hash: String,
     root_hex: String,
     proof_types: &[ProofType],
     observed_at_ms: u64,
@@ -330,6 +337,7 @@ fn failed_record(
         fetched.slot(),
         fetched.root().to_string(),
         block_number,
+        block_hash,
         root_hex,
         proof_types.iter().map(|p| p.as_str().to_string()).collect(),
         observed_at_ms,
@@ -339,18 +347,23 @@ fn failed_record(
     mark_failed(record, FailureStage::Submit, reason, error)
 }
 
-/// Marks a record failed with the given stage, reason, and detail, stamping resolution.
+/// Marks every proof of a record failed with the given stage, reason, and
+/// detail, stamping resolution. A failure before or at submission affects all
+/// requested proof types alike, since none of them reached the prover.
 fn mark_failed(
     mut record: BlockRecord,
     stage: FailureStage,
     reason: &str,
     error: String,
 ) -> BlockRecord {
-    record.outcome = Outcome::Failed;
-    record.stage = Some(stage);
-    record.reason = Some(reason.to_string());
-    record.error = Some(error);
-    record.resolved_at_ms = Some(status::now_ms());
+    let resolved_at_ms = status::now_ms();
+    for proof in &mut record.proofs {
+        proof.outcome = Outcome::Failed;
+        proof.stage = Some(stage);
+        proof.reason = Some(reason.to_string());
+        proof.error = Some(error.clone());
+        proof.resolved_at_ms = Some(resolved_at_ms);
+    }
     record
 }
 
@@ -381,6 +394,11 @@ async fn watch(
 }
 
 /// Records a single proof event's outcome and runs artifact actions on completion.
+///
+/// Events are routed to the matching [`crate::status::ProofRecord`] by proof
+/// type; unknown
+/// roots, unrequested proof types, and duplicate terminal events resolve
+/// nothing and are ignored.
 async fn handle_proof_event(
     zkboost: &zkboost::Client,
     store: &Arc<dyn StatusStore>,
@@ -390,19 +408,22 @@ async fn handle_proof_event(
     match event {
         ProofEvent::ProofComplete(complete) => {
             let root_hex = complete.new_payload_request_root.to_string();
-            if !store.seen(&root_hex).await {
+            let Some(resolution) = store
+                .resolve_proof(
+                    &root_hex,
+                    complete.proof_type.as_str(),
+                    Outcome::Complete,
+                    None,
+                )
+                .await?
+            else {
                 return Ok(());
-            }
-            let duration_ms = store
-                .set_outcome(&root_hex, Outcome::Complete, None)
-                .await?;
+            };
             let proof_type = complete.proof_type.to_string();
             counter!(PROOF_COMPLETIONS, "proof_type" => proof_type.clone()).increment(1);
             gauge!(INFLIGHT_REQUESTS).decrement(1.0);
-            if let Some(ms) = duration_ms {
-                histogram!(COMPLETION_DURATION, "proof_type" => proof_type)
-                    .record(ms as f64 / 1000.0);
-            }
+            histogram!(COMPLETION_DURATION, "proof_type" => proof_type)
+                .record(resolution.duration_ms as f64 / 1000.0);
             info!(root = %root_hex, proof_type = %complete.proof_type, "proof complete");
             if artifacts.needs_proof_bytes() {
                 zkboost
@@ -416,26 +437,26 @@ async fn handle_proof_event(
         }
         ProofEvent::ProofFailure(failure) => {
             let root_hex = failure.new_payload_request_root.to_string();
-            if !store.seen(&root_hex).await {
-                return Ok(());
-            }
-            let proof_type = failure.proof_type.to_string();
             let reason = format!("{:?}", failure.reason);
-            // Metrics stay labeled by the low-cardinality reason only; the
-            // free-form error text is kept on the record, never as a label.
-            counter!(PROOF_FAILURES, "proof_type" => proof_type, "reason" => reason.clone())
-                .increment(1);
-            store
-                .set_outcome(
+            let Some(_resolution) = store
+                .resolve_proof(
                     &root_hex,
+                    failure.proof_type.as_str(),
                     Outcome::Failed,
                     Some(status::Failure {
                         stage: FailureStage::Proving,
-                        reason,
+                        reason: reason.clone(),
                         error: failure.error.clone(),
                     }),
                 )
-                .await?;
+                .await?
+            else {
+                return Ok(());
+            };
+            // Metrics stay labeled by the low-cardinality reason only; the
+            // free-form error text is kept on the record, never as a label.
+            let proof_type = failure.proof_type.to_string();
+            counter!(PROOF_FAILURES, "proof_type" => proof_type, "reason" => reason).increment(1);
             gauge!(INFLIGHT_REQUESTS).decrement(1.0);
             warn!(
                 root = %root_hex,
@@ -464,13 +485,14 @@ mod tests {
     }
 
     #[test]
-    fn mark_failed_sets_outcome_and_detail() {
+    fn mark_failed_sets_outcome_and_detail_on_every_proof() {
         let base = BlockRecord::new(
             100,
             "0xbeacon".to_string(),
             99,
+            "0xexechash".to_string(),
             "0xroot".to_string(),
-            vec!["reth-zisk".to_string()],
+            vec!["reth-zisk".to_string(), "ethrex-sp1".to_string()],
             1_000,
         );
         let failed = mark_failed(
@@ -480,11 +502,15 @@ mod tests {
             "connection refused".to_string(),
         );
 
-        assert_eq!(failed.outcome, Outcome::Failed);
-        assert_eq!(failed.stage, Some(FailureStage::Submit));
-        assert_eq!(failed.reason.as_deref(), Some("SubmitError"));
-        assert_eq!(failed.error.as_deref(), Some("connection refused"));
-        assert!(failed.resolved_at_ms.is_some());
+        assert_eq!(failed.outcome(), Outcome::Failed);
+        assert_eq!(failed.proofs.len(), 2);
+        for proof in &failed.proofs {
+            assert_eq!(proof.outcome, Outcome::Failed);
+            assert_eq!(proof.stage, Some(FailureStage::Submit));
+            assert_eq!(proof.reason.as_deref(), Some("SubmitError"));
+            assert_eq!(proof.error.as_deref(), Some("connection refused"));
+            assert!(proof.resolved_at_ms.is_some());
+        }
         // Identity fields from the base record are preserved.
         assert_eq!(failed.slot, 100);
         assert_eq!(failed.new_payload_request_root, "0xroot");

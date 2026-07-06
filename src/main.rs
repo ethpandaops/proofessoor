@@ -170,16 +170,17 @@ async fn run_status(args: StatusArgs) -> Result<()> {
             |value: Option<u64>| value.map_or_else(|| "-".to_string(), |ms| format!("{ms}ms"));
         // Only the short reason category goes inline; the free-form error text
         // would blow out the column layout and stays in the API and status.json.
+        // The line shows the block's derived (worst-of) outcome and the first
+        // failed proof's reason; per-proof detail lives in the API.
         let failure = record
-            .reason
-            .as_deref()
+            .failure_reason()
             .map(|reason| format!("  {reason}"))
             .unwrap_or_default();
         println!(
             "{:<10} {:<10} {:<9} {:>8} {:>8} {:>8}  {}{}",
             record.slot,
             record.execution_block_number,
-            format!("{:?}", record.outcome).to_lowercase(),
+            record.outcome().as_str(),
             format!("{}ms", record.prep_ms()),
             fmt_ms(record.completion_ms()),
             fmt_ms(record.end_to_end_ms()),

@@ -5,6 +5,12 @@
 //! roots across restarts, and exposes the latest processed slot. The default
 //! [`JsonStatusStore`] keeps the state in memory and snapshots it to a JSON
 //! file; a different backend (SQLite, etc.) can be dropped in behind the trait.
+//!
+//! A [`BlockRecord`] holds the block-level facts and one [`ProofRecord`] per
+//! requested proof type; the block outcome is derived, worst-of, across its
+//! proofs. State files written by earlier releases (v0.2.x and below) used a
+//! flat, single-outcome record shape and are not readable — delete the state
+//! directory when upgrading across that boundary.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +31,17 @@ pub enum Outcome {
     Complete,
     /// At least one requested proof failed.
     Failed,
+}
+
+impl Outcome {
+    /// The lowercase wire/display name (`sent`, `complete`, `failed`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Which side a failure occurred on.
@@ -55,20 +72,12 @@ pub struct Failure {
     pub error: String,
 }
 
-/// A recorded proof request for one beacon block.
+/// Status of one requested proof (one proof type) for a block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockRecord {
-    /// Slot of the beacon block.
-    pub slot: u64,
-    /// Beacon block root (0x-hex).
-    pub beacon_block_root: String,
-    /// Execution block number.
-    pub execution_block_number: u64,
-    /// The `new_payload_request_root` identifying the request (0x-hex).
-    pub new_payload_request_root: String,
-    /// Proof types requested.
-    pub proof_types: Vec<String>,
-    /// Latest known outcome.
+pub struct ProofRecord {
+    /// Proof type requested (e.g. `reth-zisk`).
+    pub proof_type: String,
+    /// Latest known outcome for this proof.
     pub outcome: Outcome,
     /// Which side the failure occurred on, set when the outcome is `Failed`.
     #[serde(default)]
@@ -79,58 +88,187 @@ pub struct BlockRecord {
     /// Human-readable failure detail, set when the outcome is `Failed`.
     #[serde(default)]
     pub error: Option<String>,
-    /// Unix milliseconds when the block was discovered (processing started).
-    #[serde(default)]
-    pub observed_at_ms: u64,
     /// Unix milliseconds when the request was submitted.
     pub requested_at_ms: u64,
-    /// Unix milliseconds when the request resolved (completed or failed), if it has.
+    /// Unix milliseconds when this proof resolved (completed or failed), if it has.
     #[serde(default)]
     pub resolved_at_ms: Option<u64>,
+    /// Time this proof spent queued inside zkBoost before proving started.
+    /// Always `None` today — zkBoost's proof events do not carry queue timing.
+    /// TODO: populate by denormalizing zkBoost's SSE payload once events carry it.
+    #[serde(default)]
+    pub queue_ms: Option<u64>,
+    /// Pure proving time inside zkBoost, excluding queueing.
+    /// Always `None` today, for the same reason as `queue_ms`.
+    /// TODO: populate by denormalizing zkBoost's SSE payload once events carry it.
+    #[serde(default)]
+    pub prove_ms: Option<u64>,
+    /// 1-based attempt number. Always 1 today: failures are recorded, not
+    /// resubmitted (zkBoost owns proof coordination). This field is where
+    /// per-attempt bookkeeping lives once retry of transient submit failures
+    /// is implemented.
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
 }
 
-impl BlockRecord {
-    /// Creates a record in the [`Outcome::Sent`] state, stamped with the submit time.
-    pub fn new(
-        slot: u64,
-        beacon_block_root: String,
-        execution_block_number: u64,
-        new_payload_request_root: String,
-        proof_types: Vec<String>,
-        observed_at_ms: u64,
-    ) -> Self {
+/// Records created before attempt tracking carry an implicit first attempt.
+fn default_attempt() -> u32 {
+    1
+}
+
+impl ProofRecord {
+    /// Creates a proof in the [`Outcome::Sent`] state, stamped with the submit time.
+    fn sent(proof_type: String, requested_at_ms: u64) -> Self {
         Self {
-            slot,
-            beacon_block_root,
-            execution_block_number,
-            new_payload_request_root,
-            proof_types,
+            proof_type,
             outcome: Outcome::Sent,
             stage: None,
             reason: None,
             error: None,
-            observed_at_ms,
-            requested_at_ms: now_ms(),
+            requested_at_ms,
             resolved_at_ms: None,
+            queue_ms: None,
+            prove_ms: None,
+            attempt: 1,
         }
+    }
+}
+
+/// A recorded proof request for one beacon block.
+///
+/// Holds the block-level facts plus one [`ProofRecord`] per requested proof
+/// type. Block-level outcome and timing are derived from the proofs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockRecord {
+    /// Slot of the beacon block.
+    pub slot: u64,
+    /// Beacon block root (0x-hex).
+    pub beacon_block_root: String,
+    /// Execution block number.
+    pub execution_block_number: u64,
+    /// Execution block hash (0x-hex). The join key for zkBoost's per-block
+    /// dashboard data (which is keyed by execution hash, not by the request
+    /// root), for zkBoost's structured logs, and for explorer links. Unlike
+    /// the block number, it stays unambiguous across reorgs.
+    pub execution_block_hash: String,
+    /// The `new_payload_request_root` identifying the request (0x-hex).
+    pub new_payload_request_root: String,
+    /// Unix milliseconds when the block was discovered (processing started).
+    #[serde(default)]
+    pub observed_at_ms: u64,
+    /// OpenTelemetry trace id (hex) of the span covering this block's pipeline,
+    /// when tracing is enabled and the trace was sampled.
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    /// Witness-generation time reported by zkBoost. Always `None` today —
+    /// zkBoost's proof events do not carry witness timing.
+    /// TODO: populate by denormalizing zkBoost's SSE payload once events carry it.
+    #[serde(default)]
+    pub witness_ms: Option<u64>,
+    /// Per-proof-type status, one entry per requested proof type.
+    pub proofs: Vec<ProofRecord>,
+}
+
+impl BlockRecord {
+    /// Creates a record whose proofs are all in the [`Outcome::Sent`] state,
+    /// stamped with the submit time.
+    pub fn new(
+        slot: u64,
+        beacon_block_root: String,
+        execution_block_number: u64,
+        execution_block_hash: String,
+        new_payload_request_root: String,
+        proof_types: Vec<String>,
+        observed_at_ms: u64,
+    ) -> Self {
+        let requested_at_ms = now_ms();
+        Self {
+            slot,
+            beacon_block_root,
+            execution_block_number,
+            execution_block_hash,
+            new_payload_request_root,
+            observed_at_ms,
+            trace_id: None,
+            witness_ms: None,
+            proofs: proof_types
+                .into_iter()
+                .map(|proof_type| ProofRecord::sent(proof_type, requested_at_ms))
+                .collect(),
+        }
+    }
+
+    /// Derived block outcome, worst-of across proofs: any failed proof makes
+    /// the block failed; otherwise any unresolved proof keeps it in flight;
+    /// otherwise every proof completed.
+    pub fn outcome(&self) -> Outcome {
+        let mut outcome = Outcome::Complete;
+        for proof in &self.proofs {
+            match proof.outcome {
+                Outcome::Failed => return Outcome::Failed,
+                Outcome::Sent => outcome = Outcome::Sent,
+                Outcome::Complete => {}
+            }
+        }
+        outcome
+    }
+
+    /// When the request was submitted: the earliest submission across proofs
+    /// (all proofs of a block are submitted in one request today).
+    pub fn requested_at_ms(&self) -> Option<u64> {
+        self.proofs.iter().map(|p| p.requested_at_ms).min()
+    }
+
+    /// When the block resolved: the latest proof resolution, present only once
+    /// every proof has resolved.
+    pub fn resolved_at_ms(&self) -> Option<u64> {
+        let mut latest: Option<u64> = None;
+        for proof in &self.proofs {
+            let resolved = proof.resolved_at_ms?;
+            latest = Some(latest.map_or(resolved, |ms| ms.max(resolved)));
+        }
+        latest
     }
 
     /// Prep time (discovery to submit) in milliseconds.
     pub fn prep_ms(&self) -> u64 {
-        self.requested_at_ms.saturating_sub(self.observed_at_ms)
+        self.requested_at_ms()
+            .unwrap_or(self.observed_at_ms)
+            .saturating_sub(self.observed_at_ms)
     }
 
     /// zkBoost turnaround (submit to resolution) in milliseconds, if resolved.
     pub fn completion_ms(&self) -> Option<u64> {
-        self.resolved_at_ms
-            .map(|resolved| resolved.saturating_sub(self.requested_at_ms))
+        match (self.resolved_at_ms(), self.requested_at_ms()) {
+            (Some(resolved), Some(requested)) => Some(resolved.saturating_sub(requested)),
+            _ => None,
+        }
     }
 
     /// End-to-end time (discovery to resolution) in milliseconds, if resolved.
     pub fn end_to_end_ms(&self) -> Option<u64> {
-        self.resolved_at_ms
+        self.resolved_at_ms()
             .map(|resolved| resolved.saturating_sub(self.observed_at_ms))
     }
+
+    /// The first failed proof's failure category, if any proof failed.
+    pub fn failure_reason(&self) -> Option<&str> {
+        self.proofs
+            .iter()
+            .find(|proof| proof.outcome == Outcome::Failed)
+            .and_then(|proof| proof.reason.as_deref())
+    }
+}
+
+/// The result of resolving one proof to a terminal outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofResolution {
+    /// Submit-to-resolution duration for the resolved proof, in milliseconds.
+    pub duration_ms: u64,
+    /// The derived block outcome after this transition.
+    pub block_outcome: Outcome,
+    /// Whether every proof on the block has now resolved.
+    pub block_resolved: bool,
 }
 
 /// A narrow, swappable interface for persisting request status.
@@ -142,14 +280,18 @@ pub trait StatusStore: Send + Sync {
     /// Records (or replaces) a request record.
     async fn record(&self, record: BlockRecord) -> Result<()>;
 
-    /// Updates the outcome (and failure detail, if any) of a recorded request,
-    /// returning its request-to-resolution duration in milliseconds if present.
-    async fn set_outcome(
+    /// Resolves one proof of a recorded request to a terminal outcome.
+    ///
+    /// Returns `None` when there is nothing to transition: the root is not
+    /// recorded, the proof type was not requested, or the proof already
+    /// resolved (duplicate events are ignored, keeping this idempotent).
+    async fn resolve_proof(
         &self,
         root: &str,
+        proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
-    ) -> Result<Option<u64>>;
+    ) -> Result<Option<ProofResolution>>;
 
     /// The highest slot recorded so far, if any.
     async fn latest_slot(&self) -> Option<u64>;
@@ -182,22 +324,37 @@ impl State {
             .insert(record.new_payload_request_root.clone(), record);
     }
 
-    fn set_outcome(
+    fn resolve_proof(
         &mut self,
         root: &str,
+        proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
-    ) -> Option<u64> {
+    ) -> Option<ProofResolution> {
         let record = self.records.get_mut(root)?;
+        // Only a still-sent proof can transition; a repeated terminal event
+        // (e.g. a reconciliation racing the live stream) is a no-op.
+        let proof = record
+            .proofs
+            .iter_mut()
+            .find(|proof| proof.proof_type == proof_type && proof.outcome == Outcome::Sent)?;
         let now = now_ms();
-        record.outcome = outcome;
+        proof.outcome = outcome;
         if let Some(failure) = failure {
-            record.stage = Some(failure.stage);
-            record.reason = Some(failure.reason);
-            record.error = Some(failure.error);
+            proof.stage = Some(failure.stage);
+            proof.reason = Some(failure.reason);
+            proof.error = Some(failure.error);
         }
-        record.resolved_at_ms = Some(now);
-        Some(now.saturating_sub(record.requested_at_ms))
+        proof.resolved_at_ms = Some(now);
+        let duration_ms = now.saturating_sub(proof.requested_at_ms);
+        Some(ProofResolution {
+            duration_ms,
+            block_outcome: record.outcome(),
+            block_resolved: record
+                .proofs
+                .iter()
+                .all(|proof| proof.outcome != Outcome::Sent),
+        })
     }
 
     fn latest_slot(&self) -> Option<u64> {
@@ -282,16 +439,20 @@ impl StatusStore for JsonStatusStore {
         self.persist(&state).await
     }
 
-    async fn set_outcome(
+    async fn resolve_proof(
         &self,
         root: &str,
+        proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<ProofResolution>> {
         let mut state = self.state.lock().await;
-        let duration = state.set_outcome(root, outcome, failure);
-        self.persist(&state).await?;
-        Ok(duration)
+        let resolution = state.resolve_proof(root, proof_type, outcome, failure);
+        // Persist only when something transitioned; no-op events cost no I/O.
+        if resolution.is_some() {
+            self.persist(&state).await?;
+        }
+        Ok(resolution)
     }
 
     async fn latest_slot(&self) -> Option<u64> {
@@ -333,13 +494,18 @@ impl StatusStore for MemoryStatusStore {
         Ok(())
     }
 
-    async fn set_outcome(
+    async fn resolve_proof(
         &self,
         root: &str,
+        proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
-    ) -> Result<Option<u64>> {
-        Ok(self.state.lock().await.set_outcome(root, outcome, failure))
+    ) -> Result<Option<ProofResolution>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .resolve_proof(root, proof_type, outcome, failure))
     }
 
     async fn latest_slot(&self) -> Option<u64> {
@@ -380,8 +546,21 @@ mod tests {
             slot,
             "0xbeacon".to_string(),
             slot - 1,
+            "0xexechash".to_string(),
             root.to_string(),
             vec!["reth-zisk".to_string()],
+            0,
+        )
+    }
+
+    fn multi_proof_record(slot: u64, root: &str) -> BlockRecord {
+        BlockRecord::new(
+            slot,
+            "0xbeacon".to_string(),
+            slot - 1,
+            "0xexechash".to_string(),
+            root.to_string(),
+            vec!["reth-zisk".to_string(), "ethrex-sp1".to_string()],
             0,
         )
     }
@@ -411,14 +590,17 @@ mod tests {
         let store = JsonStatusStore::load(&dir, 0).await.expect("load");
         store.record(record(200, "0xroot")).await.expect("record");
         store
-            .set_outcome("0xroot", Outcome::Complete, None)
+            .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
             .await
-            .expect("set outcome");
+            .expect("resolve proof");
 
         // Reload as if after a restart.
         let reloaded = JsonStatusStore::load(&dir, 0).await.expect("reload");
         assert!(reloaded.seen("0xroot").await);
         assert_eq!(reloaded.latest_slot().await, Some(200));
+        let records = reloaded.records().await;
+        let reloaded_record = records.first().expect("one record");
+        assert_eq!(reloaded_record.outcome(), Outcome::Complete);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -428,8 +610,9 @@ mod tests {
         let store = MemoryStatusStore::new(0);
         store.record(record(300, "0xroot")).await.expect("record");
         store
-            .set_outcome(
+            .resolve_proof(
                 "0xroot",
+                "reth-zisk",
                 Outcome::Failed,
                 Some(Failure {
                     stage: FailureStage::Proving,
@@ -438,14 +621,102 @@ mod tests {
                 }),
             )
             .await
-            .expect("set outcome");
+            .expect("resolve proof");
 
         let records = store.records().await;
         let failed = records.first().expect("one record");
-        assert_eq!(failed.outcome, Outcome::Failed);
-        assert_eq!(failed.stage, Some(FailureStage::Proving));
-        assert_eq!(failed.reason.as_deref(), Some("WitnessTimeout"));
-        assert_eq!(failed.error.as_deref(), Some("witness fetch exceeded 12s"));
+        assert_eq!(failed.outcome(), Outcome::Failed);
+        assert_eq!(failed.failure_reason(), Some("WitnessTimeout"));
+        let proof = failed.proofs.first().expect("one proof");
+        assert_eq!(proof.outcome, Outcome::Failed);
+        assert_eq!(proof.stage, Some(FailureStage::Proving));
+        assert_eq!(proof.reason.as_deref(), Some("WitnessTimeout"));
+        assert_eq!(proof.error.as_deref(), Some("witness fetch exceeded 12s"));
+    }
+
+    #[tokio::test]
+    async fn resolves_proofs_independently_and_derives_block_outcome() {
+        let store = MemoryStatusStore::new(0);
+        store
+            .record(multi_proof_record(400, "0xroot"))
+            .await
+            .expect("record");
+
+        // First proof completes: the other is still in flight, so the block is too.
+        let resolution = store
+            .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+            .await
+            .expect("resolve proof")
+            .expect("transitioned");
+        assert_eq!(resolution.block_outcome, Outcome::Sent);
+        assert!(!resolution.block_resolved);
+
+        // Second proof fails: worst-of makes the block failed and fully resolved.
+        let resolution = store
+            .resolve_proof(
+                "0xroot",
+                "ethrex-sp1",
+                Outcome::Failed,
+                Some(Failure {
+                    stage: FailureStage::Proving,
+                    reason: "ProvingError".to_string(),
+                    error: "boom".to_string(),
+                }),
+            )
+            .await
+            .expect("resolve proof")
+            .expect("transitioned");
+        assert_eq!(resolution.block_outcome, Outcome::Failed);
+        assert!(resolution.block_resolved);
+
+        let records = store.records().await;
+        let block = records.first().expect("one record");
+        assert_eq!(block.outcome(), Outcome::Failed);
+        assert_eq!(block.failure_reason(), Some("ProvingError"));
+    }
+
+    #[tokio::test]
+    async fn resolve_proof_ignores_duplicates_and_unknown_proofs() {
+        let store = MemoryStatusStore::new(0);
+        store.record(record(500, "0xroot")).await.expect("record");
+
+        // Unknown root and unrequested proof type transition nothing.
+        assert!(
+            store
+                .resolve_proof("0xother", "reth-zisk", Outcome::Complete, None)
+                .await
+                .expect("resolve proof")
+                .is_none()
+        );
+        assert!(
+            store
+                .resolve_proof("0xroot", "ethrex-sp1", Outcome::Complete, None)
+                .await
+                .expect("resolve proof")
+                .is_none()
+        );
+
+        // First terminal event transitions; a duplicate is a no-op.
+        assert!(
+            store
+                .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+                .await
+                .expect("resolve proof")
+                .is_some()
+        );
+        assert!(
+            store
+                .resolve_proof("0xroot", "reth-zisk", Outcome::Failed, None)
+                .await
+                .expect("resolve proof")
+                .is_none()
+        );
+
+        let records = store.records().await;
+        assert_eq!(
+            records.first().expect("one record").outcome(),
+            Outcome::Complete
+        );
     }
 
     #[tokio::test]
@@ -460,5 +731,17 @@ mod tests {
         assert!(store.seen("0xb").await);
         assert!(store.seen("0xc").await);
         assert_eq!(store.latest_slot().await, Some(102));
+    }
+
+    #[test]
+    fn current_shape_round_trips() {
+        let mut original = record(600, "0xroot");
+        original.trace_id = Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string());
+        let json = serde_json::to_string(&original).expect("serializes");
+        let parsed: BlockRecord = serde_json::from_str(&json).expect("parses");
+        assert_eq!(parsed.slot, 600);
+        assert_eq!(parsed.trace_id, original.trace_id);
+        assert_eq!(parsed.proofs.len(), 1);
+        assert_eq!(parsed.outcome(), Outcome::Sent);
     }
 }
