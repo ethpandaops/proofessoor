@@ -6,6 +6,8 @@
 mod beacon;
 mod config;
 mod metrics;
+#[cfg(feature = "otel")]
+mod otel;
 mod request;
 mod runner;
 mod status;
@@ -14,34 +16,58 @@ mod zkboost;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::config::{CheckArgs, Cli, Command, RequestArgs, StatusArgs};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing(&cli.log_level)?;
 
-    match cli.command {
+    #[cfg(feature = "otel")]
+    let (otel_provider, otel_layer) = otel::init()?;
+    #[cfg(not(feature = "otel"))]
+    let otel_layer: Option<tracing_subscriber::layer::Identity> = None;
+
+    init_tracing(&cli.log_level, otel_layer)?;
+
+    let result = match cli.command {
         Command::Request(args) => run_request(args).await,
         Command::Stream(args) => runner::run(args).await,
         Command::Check(args) => run_check(args).await,
         Command::Status(args) => run_status(args).await,
+    };
+
+    // Flush batched spans before exit; without this the tail of a run is lost.
+    #[cfg(feature = "otel")]
+    if let Some(provider) = otel_provider
+        && let Err(error) = provider.shutdown()
+    {
+        tracing::warn!(%error, "otel provider shutdown failed");
     }
+
+    result
 }
 
-/// Initializes the global tracing subscriber.
+/// Initializes the global tracing subscriber: the optional OpenTelemetry
+/// layer (compiled in by the `otel` feature and active only when an OTLP
+/// endpoint is configured) composed with the usual fmt output.
 ///
 /// `RUST_LOG` takes precedence; otherwise the `--log-level` value is used.
-fn init_tracing(log_level: &str) -> Result<()> {
+fn init_tracing(
+    log_level: &str,
+    otel_layer: Option<impl Layer<Registry> + Send + Sync>,
+) -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(log_level))
         .with_context(|| format!("invalid log level '{log_level}'"))?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
+    tracing_subscriber::registry()
+        .with(otel_layer)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(filter)
         .init();
 
     Ok(())

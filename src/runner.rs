@@ -9,10 +9,10 @@
 //! sent, since events that fired while disconnected are not redelivered. The
 //! daemon stops on SIGINT/SIGTERM.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ::metrics::{counter, gauge, histogram};
@@ -21,7 +21,7 @@ use futures::{Stream, StreamExt};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{Instrument, Span, field, info, info_span, warn};
 use zkboost_client::{Hash256, ProofType};
 
 use crate::beacon::{self, BlockEvent};
@@ -53,6 +53,14 @@ const RECONCILE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// low-cardinality bucket: a missed failure event and a zkBoost restart that
 /// orphaned the job are indistinguishable from here.
 const UNRESOLVED_REASON: &str = "Unresolved";
+
+/// Open `prove_block` root-span handles, keyed by request root.
+///
+/// A held handle keeps the span open past submission, so it spans the whole
+/// pipeline; the watcher or reconciliation records the block's outcome and
+/// drops the handle on the terminal transition, which closes the span for
+/// export. Remaining handles drop with the runner on shutdown.
+type SpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 
 /// The status model tracks proofs per type, but stream mode is restricted to a
 /// single proof type: multi-proof streaming has not been exercised end to end
@@ -105,11 +113,14 @@ pub async fn run(args: StreamArgs) -> Result<()> {
         None => Arc::new(MemoryStatusStore::new(args.max_history)),
     };
 
+    let spans: SpanRegistry = Arc::new(Mutex::new(HashMap::new()));
+
     // Observe proof outcomes (and run artifact actions) independently of submission.
     let watcher = tokio::spawn(watch(
         zkboost.clone(),
         store.clone(),
         artifacts.clone(),
+        spans.clone(),
         args.reconcile_after,
     ));
 
@@ -198,11 +209,19 @@ pub async fn run(args: StreamArgs) -> Result<()> {
             let proof_types = proof_types.clone();
             let store = store.clone();
             let latest_requested = latest_requested.clone();
+            let spans = spans.clone();
             tasks.spawn(async move {
                 let _permit = permit;
-                if let Err(error) =
-                    process_block(&beacon, &zkboost, &proof_types, &store, &latest_requested, &event)
-                        .await
+                if let Err(error) = process_block(
+                    &beacon,
+                    &zkboost,
+                    &proof_types,
+                    &store,
+                    &latest_requested,
+                    &spans,
+                    &event,
+                )
+                .await
                 {
                     warn!(slot = event.slot, block = %event.block, %error, "block processing failed");
                 }
@@ -235,23 +254,67 @@ pub async fn run(args: StreamArgs) -> Result<()> {
     Ok(())
 }
 
-/// Fetches, builds, and submits the proof request for a single block event.
+/// Runs one block's pipeline under its `prove_block` root span.
+///
+/// The span stays open past submission via [`SpanRegistry`], so the proving
+/// wait is on the trace too; the watcher or reconciliation records its
+/// `outcome` field on the block's terminal transition. Errors that bubble out
+/// here (fetch/decode failures) never reach the store, so the outcome is
+/// recorded before the span drops.
 async fn process_block(
     beacon: &beacon::Client,
     zkboost: &zkboost::Client,
     proof_types: &[ProofType],
     store: &Arc<dyn StatusStore>,
     latest_requested: &AtomicU64,
+    spans: &SpanRegistry,
     event: &BlockEvent,
+) -> Result<()> {
+    let span = prove_block_span(event.slot, &event.block.to_string());
+    let result = submit_block(
+        beacon,
+        zkboost,
+        proof_types,
+        store,
+        latest_requested,
+        spans,
+        event,
+        &span,
+    )
+    .instrument(span.clone())
+    .await;
+    if result.is_err() {
+        span.record("outcome", "failed");
+    }
+    result
+}
+
+/// Fetches, builds, and submits the proof request for a single block event.
+async fn submit_block(
+    beacon: &beacon::Client,
+    zkboost: &zkboost::Client,
+    proof_types: &[ProofType],
+    store: &Arc<dyn StatusStore>,
+    latest_requested: &AtomicU64,
+    spans: &SpanRegistry,
+    event: &BlockEvent,
+    span: &Span,
 ) -> Result<()> {
     let observed_at_ms = status::now_ms();
     let start = Instant::now();
+    let trace_id = current_trace_id(span);
     let block_id = BlockId::Root(event.block.to_string());
-    let fetched = beacon.get_block(&block_id).await?;
+    let fetched = beacon
+        .get_block(&block_id)
+        .instrument(info_span!("fetch_block"))
+        .await?;
 
     let build_start = Instant::now();
-    let payload_request = request::build(fetched.block())?;
-    let local_root = request::root(&payload_request);
+    let (payload_request, local_root) = info_span!("build_request").in_scope(|| {
+        let payload_request = request::build(fetched.block())?;
+        let local_root = request::root(&payload_request);
+        anyhow::Ok((payload_request, local_root))
+    })?;
     let root_hex = local_root.to_string();
     histogram!(REQUEST_STAGE_DURATION, "stage" => "build")
         .record(build_start.elapsed().as_secs_f64());
@@ -259,30 +322,36 @@ async fn process_block(
     // Skip blocks already requested (in this run or a previous one).
     if store.seen(&root_hex).await {
         counter!(BLOCKS_SKIPPED).increment(1);
+        span.record("outcome", "skipped");
         info!(slot = fetched.slot(), root = %local_root, "request already recorded; skipping");
         return Ok(());
     }
 
     let submit_start = Instant::now();
-    let server_root = match zkboost.request_proof(&payload_request, proof_types).await {
+    let server_root = match zkboost
+        .request_proof(&payload_request, proof_types)
+        .instrument(info_span!("submit_request"))
+        .await
+    {
         Ok(root) => root,
         Err(error) => {
             // Record the submit failure (often transient) rather than dropping it,
             // so the attempt shows as a failure instead of an absent slot. zkBoost
             // owns retry coordination, so the request is not auto-resubmitted here.
             counter!(PROOF_REQUEST_FAILURES).increment(1);
-            store
-                .record(failed_record(
-                    &fetched,
-                    payload_request.block_number(),
-                    payload_request.block_hash().to_string(),
-                    root_hex.clone(),
-                    proof_types,
-                    observed_at_ms,
-                    "SubmitError",
-                    format!("{error:#}"),
-                ))
-                .await?;
+            let mut record = failed_record(
+                &fetched,
+                payload_request.block_number(),
+                payload_request.block_hash().to_string(),
+                root_hex.clone(),
+                proof_types,
+                observed_at_ms,
+                "SubmitError",
+                format!("{error:#}"),
+            );
+            record.trace_id = trace_id;
+            store.record(record).await?;
+            span.record("outcome", "failed");
             warn!(slot = fetched.slot(), root = %local_root, %error, "proof submission failed");
             return Ok(());
         }
@@ -294,18 +363,19 @@ async fn process_block(
         // root with no incoming proof events; record it instead of leaving it to
         // linger unresolved.
         counter!(PROOF_REQUEST_FAILURES).increment(1);
-        store
-            .record(failed_record(
-                &fetched,
-                payload_request.block_number(),
-                payload_request.block_hash().to_string(),
-                root_hex.clone(),
-                proof_types,
-                observed_at_ms,
-                "RootMismatch",
-                format!("local {local_root} != server {server_root}"),
-            ))
-            .await?;
+        let mut record = failed_record(
+            &fetched,
+            payload_request.block_number(),
+            payload_request.block_hash().to_string(),
+            root_hex.clone(),
+            proof_types,
+            observed_at_ms,
+            "RootMismatch",
+            format!("local {local_root} != server {server_root}"),
+        );
+        record.trace_id = trace_id;
+        store.record(record).await?;
+        span.record("outcome", "failed");
         warn!(
             slot = fetched.slot(),
             local_root = %local_root,
@@ -321,17 +391,24 @@ async fn process_block(
     gauge!(LATEST_REQUESTED_SLOT).set(fetched.slot() as f64);
     histogram!(REQUEST_DURATION).record(start.elapsed().as_secs_f64());
 
-    store
-        .record(BlockRecord::new(
-            fetched.slot(),
-            fetched.root().to_string(),
-            payload_request.block_number(),
-            payload_request.block_hash().to_string(),
-            root_hex,
-            proof_types.iter().map(|p| p.as_str().to_string()).collect(),
-            observed_at_ms,
-        ))
-        .await?;
+    let mut record = BlockRecord::new(
+        fetched.slot(),
+        fetched.root().to_string(),
+        payload_request.block_number(),
+        payload_request.block_hash().to_string(),
+        root_hex.clone(),
+        proof_types.iter().map(|p| p.as_str().to_string()).collect(),
+        observed_at_ms,
+    );
+    record.trace_id = trace_id;
+
+    // Hold the span open before the record lands, so the watcher can never
+    // resolve a record whose span handle is not registered yet.
+    register_span(spans, root_hex.clone(), span.clone());
+    if let Err(error) = store.record(record).await {
+        drop_span(spans, &root_hex);
+        return Err(error);
+    }
 
     info!(
         slot = fetched.slot(),
@@ -342,6 +419,56 @@ async fn process_block(
         "proof requested"
     );
     Ok(())
+}
+
+/// Root span covering one block's pipeline, from discovery through proving.
+/// `outcome` starts empty and is recorded on the terminal transition.
+fn prove_block_span(slot: u64, block_root: &str) -> Span {
+    info_span!("prove_block", slot, block_root, outcome = field::Empty)
+}
+
+/// The trace id backing a block's root span: `None` unless the crate is built
+/// with the `otel` feature, an exporter is configured, and the span was
+/// sampled.
+fn current_trace_id(span: &Span) -> Option<String> {
+    #[cfg(feature = "otel")]
+    {
+        crate::otel::trace_id(span)
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = span;
+        None
+    }
+}
+
+/// Holds a block's root span open until its terminal transition.
+fn register_span(spans: &SpanRegistry, root_hex: String, span: Span) {
+    if let Ok(mut map) = spans.lock() {
+        map.insert(root_hex, span);
+    }
+}
+
+/// Drops a registered span handle without recording an outcome (used when the
+/// record it belongs to failed to persist).
+fn drop_span(spans: &SpanRegistry, root_hex: &str) {
+    if let Ok(mut map) = spans.lock() {
+        map.remove(root_hex);
+    }
+}
+
+/// On a block's terminal transition, records the derived outcome on its root
+/// span and drops the handle, closing the span for export. A no-op while
+/// proofs are still unresolved or when no handle is held (pre-submit
+/// failures resolve before registration; restarts lose handles by design).
+fn finish_block_span(spans: &SpanRegistry, root_hex: &str, resolution: &ProofResolution) {
+    if !resolution.block_resolved {
+        return;
+    }
+    let removed = spans.lock().ok().and_then(|mut map| map.remove(root_hex));
+    if let Some(span) = removed {
+        span.record("outcome", resolution.block_outcome.as_str());
+    }
 }
 
 /// Builds a `Failed` record for a request that never reached the proving stage,
@@ -400,11 +527,17 @@ async fn watch(
     zkboost: Arc<zkboost::Client>,
     store: Arc<dyn StatusStore>,
     artifacts: Arc<zkboost::Artifacts>,
+    spans: SpanRegistry,
     reconcile_after: Duration,
 ) {
     loop {
         let mut events = Box::pin(zkboost.subscribe_proof_events());
-        let reconciler = tokio::spawn(reconcile(zkboost.clone(), store.clone(), reconcile_after));
+        let reconciler = tokio::spawn(reconcile(
+            zkboost.clone(),
+            store.clone(),
+            spans.clone(),
+            reconcile_after,
+        ));
         while let Some(event) = events.next().await {
             let event = match event {
                 Ok(event) => event,
@@ -413,7 +546,9 @@ async fn watch(
                     break;
                 }
             };
-            if let Err(error) = handle_proof_event(&zkboost, &store, &artifacts, event).await {
+            if let Err(error) =
+                handle_proof_event(&zkboost, &store, &artifacts, &spans, event).await
+            {
                 warn!(%error, "failed to handle proof event");
             }
         }
@@ -427,19 +562,21 @@ async fn watch(
 /// Records a single proof event's outcome and runs artifact actions on completion.
 ///
 /// Events are routed to the matching [`crate::status::ProofRecord`] by proof
-/// type; unknown roots, unrequested proof types, and duplicate terminal events
-/// resolve nothing and are ignored.
+/// type; unknown
+/// roots, unrequested proof types, and duplicate terminal events resolve
+/// nothing and are ignored.
 async fn handle_proof_event(
     zkboost: &zkboost::Client,
     store: &Arc<dyn StatusStore>,
     artifacts: &zkboost::Artifacts,
+    spans: &SpanRegistry,
     event: ProofEvent,
 ) -> Result<()> {
     match event {
         ProofEvent::ProofComplete(complete) => {
             let root_hex = complete.new_payload_request_root.to_string();
             let Some(_resolution) =
-                record_completion(store, &root_hex, complete.proof_type.as_str()).await?
+                record_completion(store, spans, &root_hex, complete.proof_type.as_str()).await?
             else {
                 return Ok(());
             };
@@ -463,7 +600,8 @@ async fn handle_proof_event(
                 error: failure.error.clone(),
             };
             let Some(_resolution) =
-                record_failure(store, &root_hex, failure.proof_type.as_str(), detail).await?
+                record_failure(store, spans, &root_hex, failure.proof_type.as_str(), detail)
+                    .await?
             else {
                 return Ok(());
             };
@@ -484,6 +622,7 @@ async fn handle_proof_event(
 /// and reconciliation, so a race between them counts exactly once.
 async fn record_completion(
     store: &Arc<dyn StatusStore>,
+    spans: &SpanRegistry,
     root_hex: &str,
     proof_type: &str,
 ) -> Result<Option<ProofResolution>> {
@@ -493,6 +632,7 @@ async fn record_completion(
     else {
         return Ok(None);
     };
+    finish_block_span(spans, root_hex, &resolution);
     counter!(PROOF_COMPLETIONS, "proof_type" => proof_type.to_owned()).increment(1);
     gauge!(INFLIGHT_REQUESTS).decrement(1.0);
     histogram!(COMPLETION_DURATION, "proof_type" => proof_type.to_owned())
@@ -506,6 +646,7 @@ async fn record_completion(
 /// record, never as a label.
 async fn record_failure(
     store: &Arc<dyn StatusStore>,
+    spans: &SpanRegistry,
     root_hex: &str,
     proof_type: &str,
     failure: status::Failure,
@@ -517,6 +658,7 @@ async fn record_failure(
     else {
         return Ok(None);
     };
+    finish_block_span(spans, root_hex, &resolution);
     counter!(PROOF_FAILURES, "proof_type" => proof_type.to_owned(), "reason" => reason)
         .increment(1);
     gauge!(INFLIGHT_REQUESTS).decrement(1.0);
@@ -533,6 +675,7 @@ async fn record_failure(
 async fn reconcile(
     zkboost: Arc<zkboost::Client>,
     store: Arc<dyn StatusStore>,
+    spans: SpanRegistry,
     unresolved_after: Duration,
 ) {
     let stuck: Vec<BlockRecord> = store
@@ -549,9 +692,10 @@ async fn reconcile(
         .for_each_concurrent(RECONCILE_CONCURRENCY, |record| {
             let zkboost = &zkboost;
             let store = &store;
+            let spans = &spans;
             async move {
                 if let Err(error) =
-                    reconcile_record(zkboost, store, &record, unresolved_after).await
+                    reconcile_record(zkboost, store, spans, &record, unresolved_after).await
                 {
                     warn!(
                         root = %record.new_payload_request_root,
@@ -569,6 +713,7 @@ async fn reconcile(
 async fn reconcile_record(
     zkboost: &zkboost::Client,
     store: &Arc<dyn StatusStore>,
+    spans: &SpanRegistry,
     record: &BlockRecord,
     unresolved_after: Duration,
 ) -> Result<()> {
@@ -587,6 +732,7 @@ async fn reconcile_record(
     // nothing arrives within the window, nothing is cached for this root.
     let probe = apply_probe_events(
         store,
+        spans,
         root_hex,
         pending,
         zkboost.subscribe_root_events(root),
@@ -604,7 +750,7 @@ async fn reconcile_record(
         anyhow::bail!("probe stream failed before the replay window closed");
     }
 
-    resolve_silent_proofs(store, record, unresolved_after, status::now_ms()).await
+    resolve_silent_proofs(store, spans, record, unresolved_after, status::now_ms()).await
 }
 
 /// Applies completions from a per-root probe stream until every pending proof
@@ -618,6 +764,7 @@ async fn reconcile_record(
 /// resolution path is idempotent with this one.
 async fn apply_probe_events(
     store: &Arc<dyn StatusStore>,
+    spans: &SpanRegistry,
     root_hex: &str,
     mut pending: HashSet<String>,
     events: impl Stream<Item = Result<ProofEvent>> + Send,
@@ -645,7 +792,7 @@ async fn apply_probe_events(
         if !pending.remove(proof_type) {
             continue;
         }
-        match record_completion(store, root_hex, proof_type).await {
+        match record_completion(store, spans, root_hex, proof_type).await {
             Ok(Some(_)) => {
                 counter!(RECONCILE_ACTIONS, "verdict" => "complete").increment(1);
                 info!(
@@ -673,6 +820,7 @@ async fn apply_probe_events(
 /// completion is cached, so no event will ever arrive.
 async fn resolve_silent_proofs(
     store: &Arc<dyn StatusStore>,
+    spans: &SpanRegistry,
     record: &BlockRecord,
     cutoff: Duration,
     now_ms: u64,
@@ -700,6 +848,7 @@ async fn resolve_silent_proofs(
         // write makes it a no-op.
         if record_failure(
             store,
+            spans,
             &record.new_payload_request_root,
             &proof.proof_type,
             failure,
@@ -749,6 +898,10 @@ mod tests {
         Arc::new(MemoryStatusStore::new(0))
     }
 
+    fn span_registry() -> SpanRegistry {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
     async fn stored_record(store: &Arc<dyn StatusStore>) -> BlockRecord {
         store
             .records()
@@ -765,9 +918,15 @@ mod tests {
         store.record(record.clone()).await.expect("record");
 
         // 180s cutoff, and the proof has been silent for exactly that long.
-        resolve_silent_proofs(&store, &record, Duration::from_secs(180), 181_000)
-            .await
-            .expect("silence policy");
+        resolve_silent_proofs(
+            &store,
+            &span_registry(),
+            &record,
+            Duration::from_secs(180),
+            181_000,
+        )
+        .await
+        .expect("silence policy");
 
         let stored = stored_record(&store).await;
         assert_eq!(stored.outcome(), Outcome::Failed);
@@ -783,9 +942,15 @@ mod tests {
         store.record(record.clone()).await.expect("record");
 
         // Only 10s of silence against a 180s cutoff: still proving.
-        resolve_silent_proofs(&store, &record, Duration::from_secs(180), 11_000)
-            .await
-            .expect("silence policy");
+        resolve_silent_proofs(
+            &store,
+            &span_registry(),
+            &record,
+            Duration::from_secs(180),
+            11_000,
+        )
+        .await
+        .expect("silence policy");
 
         assert_eq!(stored_record(&store).await.outcome(), Outcome::Sent);
     }
@@ -802,8 +967,14 @@ mod tests {
             proof_type: zkboost::parse_proof_type("reth-zisk").expect("valid proof type"),
         }))]);
         let pending: HashSet<String> = ["reth-zisk".to_string()].into();
-        let observed =
-            apply_probe_events(&store, &record.new_payload_request_root, pending, replay).await;
+        let observed = apply_probe_events(
+            &store,
+            &span_registry(),
+            &record.new_payload_request_root,
+            pending,
+            replay,
+        )
+        .await;
 
         assert!(observed);
         assert_eq!(stored_record(&store).await.outcome(), Outcome::Complete);
@@ -819,8 +990,14 @@ mod tests {
         // the caller must not apply the silence policy.
         let replay = futures::stream::iter(vec![Err(anyhow::anyhow!("connection refused"))]);
         let pending: HashSet<String> = ["reth-zisk".to_string()].into();
-        let observed =
-            apply_probe_events(&store, &record.new_payload_request_root, pending, replay).await;
+        let observed = apply_probe_events(
+            &store,
+            &span_registry(),
+            &record.new_payload_request_root,
+            pending,
+            replay,
+        )
+        .await;
 
         assert!(!observed);
         assert_eq!(stored_record(&store).await.outcome(), Outcome::Sent);
@@ -857,14 +1034,26 @@ mod tests {
             proof_type: zkboost::parse_proof_type("reth-zisk").expect("valid proof type"),
         }))]);
         let pending: HashSet<String> = ["reth-zisk".to_string()].into();
-        let observed =
-            apply_probe_events(&store, &record.new_payload_request_root, pending, replay).await;
+        let observed = apply_probe_events(
+            &store,
+            &span_registry(),
+            &record.new_payload_request_root,
+            pending,
+            replay,
+        )
+        .await;
         assert!(observed);
 
         // The silence policy over the stale (still-sent) snapshot is a no-op too.
-        resolve_silent_proofs(&store, &record, Duration::from_secs(0), 999_000)
-            .await
-            .expect("silence policy");
+        resolve_silent_proofs(
+            &store,
+            &span_registry(),
+            &record,
+            Duration::from_secs(0),
+            999_000,
+        )
+        .await
+        .expect("silence policy");
 
         let stored = stored_record(&store).await;
         assert_eq!(stored.outcome(), Outcome::Complete);
@@ -913,5 +1102,112 @@ mod tests {
         // Identity fields from the base record are preserved.
         assert_eq!(failed.slot, 100);
         assert_eq!(failed.new_payload_request_root, "0xroot");
+    }
+
+    #[test]
+    fn finish_block_span_drops_the_handle_only_on_terminal_transitions() {
+        let spans = span_registry();
+        register_span(
+            &spans,
+            "0xroot".to_string(),
+            prove_block_span(1, "0xbeacon"),
+        );
+
+        // A partial resolution keeps the span open.
+        finish_block_span(
+            &spans,
+            "0xroot",
+            &ProofResolution {
+                duration_ms: 10,
+                block_outcome: Outcome::Sent,
+                block_resolved: false,
+            },
+        );
+        assert!(spans.lock().expect("registry lock").contains_key("0xroot"));
+
+        // The terminal transition records the outcome and releases the handle.
+        finish_block_span(
+            &spans,
+            "0xroot",
+            &ProofResolution {
+                duration_ms: 10,
+                block_outcome: Outcome::Complete,
+                block_resolved: true,
+            },
+        );
+        assert!(spans.lock().expect("registry lock").is_empty());
+    }
+
+    /// Without the `otel` feature there is no exporter to sample the span, so
+    /// records must carry no trace id.
+    #[cfg(not(feature = "otel"))]
+    #[test]
+    fn trace_id_is_none_without_the_otel_feature() {
+        assert_eq!(current_trace_id(&prove_block_span(123, "0xbeacon")), None);
+    }
+
+    /// With the feature compiled in but no otel layer installed (no OTLP
+    /// endpoint configured), spans carry no valid trace context.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn trace_id_is_none_without_an_exporter() {
+        assert_eq!(current_trace_id(&prove_block_span(123, "0xbeacon")), None);
+    }
+
+    /// With an exporter installed, the `prove_block` span exports carrying the
+    /// slot, block root, and recorded outcome, and its trace id is captured.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn prove_block_span_exports_with_slot_and_block_root() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        // Warm the span callsite before installing the subscriber, so a
+        // parallel test hitting it subscriber-less cannot leave a stale
+        // `never` interest cached (mirrors zkBoost's otel span test).
+        let _ = prove_block_span(0, "0xwarmup");
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("test")),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut exported = None;
+        for _ in 0..5 {
+            tracing::callsite::rebuild_interest_cache();
+            let span = prove_block_span(123, "0xbeacon");
+            let trace_id = current_trace_id(&span);
+            span.record("outcome", "complete");
+            drop(span);
+
+            provider.force_flush().expect("flush spans");
+            let spans = exporter.get_finished_spans().expect("finished spans");
+            if let Some(span_data) = spans.iter().find(|s| s.name == "prove_block") {
+                exported = Some((span_data.clone(), trace_id));
+                break;
+            }
+        }
+
+        let (span_data, trace_id) = exported.expect("prove_block span should export");
+        let attr = |key: &str| {
+            span_data
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.to_string())
+        };
+        assert_eq!(attr("slot").as_deref(), Some("123"));
+        assert_eq!(attr("block_root").as_deref(), Some("0xbeacon"));
+        assert_eq!(attr("outcome").as_deref(), Some("complete"));
+        // The captured trace id is the exported span's, so the record links
+        // to exactly this trace.
+        assert_eq!(
+            trace_id,
+            Some(span_data.span_context.trace_id().to_string())
+        );
     }
 }

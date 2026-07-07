@@ -86,6 +86,14 @@ pub struct Client {
 
 impl Client {
     /// Creates a client targeting the given zkBoost base URL.
+    ///
+    /// W3C trace context (`traceparent`) is not injected on outbound calls
+    /// yet: zkboost-client v0.8.0 sends requests through a plain
+    /// [`reqwest::Client`], whose only header hook (`default_headers`) is
+    /// fixed at construction, while `traceparent` must carry each request's
+    /// live span context. Injection needs a zkboost-client change — a
+    /// per-request header/middleware hook, or per-call header parameters —
+    /// and this constructor is the seam to wire it through once available.
     pub fn new(endpoint: Url) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
