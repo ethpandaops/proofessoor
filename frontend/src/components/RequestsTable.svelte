@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { BlockRecord } from '../lib/types'
-  import { e2eMs, fmt, provingMs, shortRoot, splitPct } from '../lib/format'
+  import { e2eMs, failureReason, fmt, outcome, proofTypes, provingMs, shortRoot, splitPct } from '../lib/format'
 
   let {
     blocks,
@@ -22,7 +22,7 @@
     ['failed', 'failed'],
   ]
 
-  const filtered = $derived(blocks.filter((b) => filter === 'all' || b.outcome === filter))
+  const filtered = $derived(blocks.filter((b) => filter === 'all' || outcome(b) === filter))
 </script>
 
 <section class="overflow-hidden rounded-xl border border-line bg-slate/60">
@@ -72,21 +72,22 @@
         <tbody>
           {#each filtered as r (r.new_payload_request_root)}
             {@const s = splitPct(r)}
+            {@const o = outcome(r)}
             <tr
               onclick={() => onSelect(r)}
               class="cursor-pointer border-b border-line/60 transition-colors last:border-0 hover:bg-violet/6"
             >
               <td class="py-2.5 pr-4 pl-5">{r.slot}</td>
               <td class="px-4 py-2.5 text-chalk/55">{r.execution_block_number}</td>
-              <td class="px-4 py-2.5 text-chalk/70">{r.proof_types.join(', ')}</td>
+              <td class="px-4 py-2.5 text-chalk/70">{proofTypes(r).join(', ')}</td>
               <td class="px-4 py-2.5">
-                {#if r.outcome === 'sent'}
+                {#if o === 'sent'}
                   <span class="text-xs/5 text-gold/80">…</span>
                 {:else}
                   <div class="flex h-1.5 w-32 overflow-hidden rounded-full bg-ink">
                     <div class="h-full bg-violet" style="width: {s.prep}%"></div>
                     <div
-                      class="h-full {r.outcome === 'failed' ? 'bg-ember/70' : 'bg-spark'}"
+                      class="h-full {o === 'failed' ? 'bg-ember/70' : 'bg-spark'}"
                       style="width: {s.proving}%"
                     ></div>
                   </div>
@@ -95,11 +96,11 @@
               <td class="px-4 py-2.5 text-right font-medium text-spark/90">{fmt(provingMs(r))}</td>
               <td class="px-4 py-2.5 text-right text-chalk/80">{fmt(e2eMs(r))}</td>
               <td class="px-4 py-2.5">
-                {#if r.outcome === 'complete'}
+                {#if o === 'complete'}
                   <span class="rounded-md bg-spark/12 px-2 py-0.5 text-xs/5 text-spark">complete</span>
-                {:else if r.outcome === 'failed'}
+                {:else if o === 'failed'}
                   <span class="rounded-md bg-ember/12 px-2 py-0.5 text-xs/5 text-ember"
-                    >failed · {r.reason ?? 'unknown'}</span
+                    >failed · {failureReason(r) ?? 'unknown'}</span
                   >
                 {:else}
                   <span class="rounded-md bg-gold/12 px-2 py-0.5 text-xs/5 text-gold">in-flight</span>

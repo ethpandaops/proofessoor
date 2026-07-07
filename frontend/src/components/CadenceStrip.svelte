@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { BlockRecord, StatusSummary } from '../lib/types'
-  import { barHeight, buildCadence, e2eDomain, fmt, provingMs, provingStats, splitPct } from '../lib/format'
+  import { barHeight, buildCadence, e2eDomain, fmt, outcome, provingMs, provingStats, splitPct } from '../lib/format'
   import Tooltip from './Tooltip.svelte'
 
   let {
@@ -72,16 +72,17 @@
       {:else}
         {@const r = cell.r}
         {@const s = splitPct(r)}
+        {@const o = outcome(r)}
         <button
           type="button"
           onclick={() => onSelect(r)}
-          title="slot {r.slot} · {r.outcome}"
+          title="slot {r.slot} · {o}"
           class="group flex w-1.75 shrink-0 flex-col justify-end overflow-hidden rounded-xs transition-transform hover:-translate-y-0.5"
           style="height: {barHeight(r, domain)}px"
         >
-          {#if r.outcome === 'failed'}
+          {#if o === 'failed'}
             <div class="size-full bg-ember/85 group-hover:bg-ember"></div>
-          {:else if r.outcome === 'sent'}
+          {:else if o === 'sent'}
             <div class="size-full animate-pulse bg-gold/70"></div>
           {:else}
             <div class="w-full bg-spark" style="height: {s.proving}%"></div>
