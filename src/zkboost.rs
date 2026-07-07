@@ -121,6 +121,20 @@ impl Client {
             .map(|event| event.context("zkBoost proof event stream error"))
     }
 
+    /// Subscribes to the proof events of a single request root.
+    ///
+    /// On connect zkBoost replays the completions it still holds cached for
+    /// that root before any live events; failures are never replayed. That
+    /// replay is what reconciliation probes for after a stream drop.
+    pub fn subscribe_root_events(
+        &self,
+        root: Hash256,
+    ) -> impl Stream<Item = Result<ProofEvent>> + Send + '_ {
+        self.inner
+            .subscribe_proof_events(Some(root))
+            .map(|event| event.context("zkBoost proof event stream error"))
+    }
+
     /// Waits for every requested proof to complete or fail, logging each result.
     ///
     /// Subscribes to the proof event stream filtered to `root`. For completed

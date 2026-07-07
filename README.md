@@ -112,11 +112,17 @@ non-optimistic block. Useful flags:
 - `--http-addr HOST:PORT` — serve the dashboard, metrics, and health (below).
 - `--ui-dir DIR` — directory of built dashboard assets to serve.
 - `--download` / `--verify` / `--out-dir` — save and/or verify completed proofs.
+- `--reconcile-after DURATION` — how long a submitted proof may stay unresolved
+  before reconciliation (run whenever the proof-event stream reconnects) marks
+  it failed as `Unresolved` (default `180s`; accepts `s`/`m`/`h` suffixes).
+  Keep it above zkBoost's `witness_timeout` + `proof_timeout` so proofs still
+  being proven are never written off.
 
-> **Stream proves one proof type at a time.** It records one outcome per block,
-> which can't represent different results for several proof types on the same
-> block, so it accepts exactly one `--proof-types` value. Use `request` for
-> multiple.
+> **Stream proves one proof type at a time.** The status model tracks each
+> proof type separately, but multi-proof streaming is unexercised end to end
+> (dashboard aggregation, per-type failure display) and proving several types
+> per block multiplies prover cost, so stream accepts exactly one
+> `--proof-types` value for now. Use `request` for multiple.
 
 `--http-addr` takes a host and port of your choosing and serves three things on
 that address: the dashboard at `/`, Prometheus metrics at `/metrics`, and a
