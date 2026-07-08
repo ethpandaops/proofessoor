@@ -16,8 +16,15 @@ use zkboost_client::{Hash256, MainnetEthSpec, NewPayloadRequest, ProofType, zkBo
 
 pub use zkboost_client::ProofEvent;
 
-/// Default timeout applied to zkBoost HTTP requests.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on establishing a TCP connection to zkBoost.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on each socket read. This is the hang detector for both unary calls
+/// and the long-lived SSE event stream: zkBoost sends an SSE keep-alive every
+/// 15s, so a 60s read gap means the connection is dead, not quiet. A *total*
+/// request timeout would instead kill the healthy event stream on schedule
+/// (it did, every 30s), forcing constant reconnect/reconcile churn.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Parses a proof type name (e.g. `reth-zisk`) into a zkBoost [`ProofType`].
 pub fn parse_proof_type(name: &str) -> Result<ProofType> {
@@ -96,7 +103,8 @@ impl Client {
     /// and this constructor is the seam to wire it through once available.
     pub fn new(endpoint: Url) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .context("failed to build zkBoost HTTP client")?;
         let inner = zkBoostClient::with_http_client(endpoint.clone(), http.clone());

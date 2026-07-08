@@ -19,8 +19,17 @@ use url::Url;
 use crate::config::BlockId;
 use crate::metrics::REQUEST_STAGE_DURATION;
 
-/// Default timeout applied to Beacon API requests.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on establishing a TCP connection to the Beacon API.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on each socket read. This is the hang detector for both unary calls
+/// and the long-lived SSE event stream. The Beacon API event stream carries no
+/// keep-alive comments — with `topics=block` an event arrives roughly every
+/// slot (12s) — so 120s (~10 empty slots) separates a dead connection from a
+/// quiet chain. A *total* request timeout would instead kill the healthy
+/// event stream on schedule (it did, every 30s), dropping the blocks that
+/// land in each reconnect gap.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Header carrying the consensus fork used to encode an SSZ beacon block.
 const CONSENSUS_VERSION_HEADER: &str = "Eth-Consensus-Version";
@@ -115,7 +124,8 @@ impl Client {
     /// entries are ignored, so an unset PROOFESSOOR_BEACON_HEADER is fine.
     pub fn new(endpoint: Url, headers: &[String]) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .default_headers(build_header_map(headers)?)
             .build()
             .context("failed to build Beacon API HTTP client")?;
