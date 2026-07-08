@@ -979,6 +979,21 @@ async fn reconcile(
     liveness: &LivenessAnchor,
 ) {
     let stuck = store.unresolved_records().await;
+    // Age floor: only probe records that have waited at least a quarter of
+    // the verdict cutoff. A seconds-old record cannot face the silence policy
+    // for a long time, so probing it every sweep would only churn one
+    // short-lived SSE subscription per record per RECONCILE_INTERVAL (and,
+    // with enough stuck records, keep sweeps running back to back). A quarter
+    // still leaves several probe opportunities before any record can reach
+    // the cutoff; the cost is that a completion missed during a brief
+    // disconnect is picked up from the replay cache up to cutoff/4 later
+    // instead of on the next sweep.
+    let probe_floor_ms = u64::try_from((unresolved_after / 4).as_millis()).unwrap_or(u64::MAX);
+    let sweep_start_ms = status::now_ms();
+    let stuck: Vec<BlockRecord> = stuck
+        .into_iter()
+        .filter(|record| old_enough_to_probe(record, sweep_start_ms, probe_floor_ms))
+        .collect();
     if stuck.is_empty() {
         return;
     }
@@ -1047,6 +1062,16 @@ async fn reconcile(
             );
         }
     }
+}
+
+/// Whether a record has waited past the sweep's probe age floor (see the
+/// comment in [`reconcile`]). Ages from the record's earliest submission; a
+/// record with no proofs (which the unresolved filter never yields) counts
+/// as old enough rather than silently unprobeable.
+fn old_enough_to_probe(record: &BlockRecord, now_ms: u64, floor_ms: u64) -> bool {
+    record
+        .requested_at_ms()
+        .is_none_or(|requested| now_ms.saturating_sub(requested) >= floor_ms)
 }
 
 /// Probes one record's per-root subscription for replayed completions.
@@ -1585,6 +1610,17 @@ mod tests {
         .expect("record completion");
         assert!(result.is_none());
         assert_eq!(stored_record(&store).await.outcome(), Outcome::Failed);
+    }
+
+    #[test]
+    fn probe_age_floor_skips_young_records() {
+        let record = sent_record(100_000);
+
+        // Younger than the floor: skipped this sweep, probed on a later one.
+        assert!(!old_enough_to_probe(&record, 130_000, 45_000));
+        // At or past the floor: probed.
+        assert!(old_enough_to_probe(&record, 145_000, 45_000));
+        assert!(old_enough_to_probe(&record, 200_000, 45_000));
     }
 
     #[test]
