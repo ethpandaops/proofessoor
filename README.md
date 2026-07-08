@@ -118,9 +118,14 @@ non-optimistic block. Useful flags:
   `witness_timeout` + worst-case queue wait + `proof_timeout` — the queue wait
   is unbounded under proving backlog (`proof_timeout` bounds only the prove
   call), so leave generous headroom. Reconciliation runs when the proof-event
-  stream (re)connects and periodically while connected; silence only counts
-  while zkBoost is observably reachable, and all verdicts are deferred while
-  it is not. Missed *completions* are recovered from zkBoost's replay cache,
+  stream (re)connects and periodically while connected, probing only records
+  older than a quarter of this cutoff; silence only counts while zkBoost is
+  observably reachable, and all verdicts are deferred while it is not. A real
+  outcome arriving after a proof was already judged is discarded (records
+  resolve once) but is counted in
+  `proofessoor_late_events_discarded_total{kind}` and logged, so a wrong
+  verdict is observable. Missed *completions* are recovered from zkBoost's
+  replay cache,
   but that cache holds only the most recent completions (LRU, 128 entries),
   so an outage spanning more than ~128 completions can still lose outcomes —
   an upstream zkBoost change to also replay failures is in flight and will be

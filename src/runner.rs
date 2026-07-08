@@ -559,6 +559,12 @@ fn current_trace_id(span: &Span) -> Option<String> {
 }
 
 /// Holds a block's root span open until its terminal transition.
+///
+/// Above `--max-inflight 1`, a duplicate submission of the same root (see the
+/// non-atomic seen-check note in [`submit_block`]) overwrites the previous
+/// handle here: the replaced span closes without an outcome recorded.
+/// Accepted — the store record is replaced the same way, so the surviving
+/// span and record stay consistent with each other.
 fn register_span(spans: &SpanRegistry, root_hex: String, span: Span) {
     if let Ok(mut map) = spans.lock() {
         map.insert(root_hex, span);
@@ -598,6 +604,11 @@ fn close_evicted_spans(spans: &SpanRegistry, evicted: &[String]) {
 /// zero) and history eviction (which can drop still-unresolved proofs) are
 /// both reflected on the next set, where event deltas would leave the gauge
 /// negative or permanently inflated.
+///
+/// The count-then-set pair is not atomic: two concurrent syncs can interleave
+/// and briefly publish the staler count. Accepted — the very next sync
+/// self-corrects, since every value is recomputed from store state rather
+/// than accumulated.
 async fn sync_inflight_gauge(store: &Arc<dyn StatusStore>) {
     gauge!(INFLIGHT_REQUESTS).set(store.inflight_proofs().await as f64);
 }

@@ -29,6 +29,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// quiet chain. A *total* request timeout would instead kill the healthy
 /// event stream on schedule (it did, every 30s), dropping the blocks that
 /// land in each reconnect gap.
+///
+/// Known residual gap (accepted): a chain that goes eventless for longer than
+/// this — devnet lulls, non-finality stretches of empty slots — tears down a
+/// healthy stream on schedule, and any block landing inside the reconnect
+/// window is never requested: there is no backfill on reconnect, the stream
+/// only carries blocks arriving after it opens. Backfill-on-reconnect is the
+/// eventual fix if missed blocks matter on such chains.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Header carrying the consensus fork used to encode an SSZ beacon block.
