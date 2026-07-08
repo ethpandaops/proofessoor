@@ -282,9 +282,23 @@ pub async fn run(args: StreamArgs) -> Result<()> {
         "stopping; draining in-flight submissions"
     );
     tasks.shutdown().await;
+    // Abort *and await* the background tasks: awaiting lets any in-flight
+    // resolution land (store write, metrics, span close) before main flushes
+    // the otel provider, where an un-awaited abort would race that flush and
+    // drop the tail of the run's spans.
     watcher.abort();
+    if let Err(error) = watcher.await
+        && !error.is_cancelled()
+    {
+        warn!(%error, "watcher task failed during shutdown");
+    }
     if let Some(server) = http_server {
         server.abort();
+        if let Err(error) = server.await
+            && !error.is_cancelled()
+        {
+            warn!(%error, "http server task failed during shutdown");
+        }
     }
     Ok(())
 }
@@ -354,7 +368,12 @@ async fn submit_block(
     histogram!(REQUEST_STAGE_DURATION, "stage" => "build")
         .record(build_start.elapsed().as_secs_f64());
 
-    // Skip blocks already requested (in this run or a previous one).
+    // Skip blocks already requested (in this run or a previous one). The
+    // check-then-record pair is not atomic: above the default --max-inflight
+    // of 1, two concurrent submissions of one root could both pass it and
+    // submit twice. The store keys records by root — the second record
+    // replaces the first and events still resolve once — so the cost is a
+    // redundant submission to zkBoost, not a corrupt record.
     if store.seen(&root_hex).await {
         counter!(BLOCKS_SKIPPED).increment(1);
         span.record("outcome", "skipped");
@@ -753,30 +772,48 @@ async fn handle_proof_event(
 /// Resolves one proof to `Complete` in the store, emitting the completion
 /// metrics when something actually transitioned. Shared by the live watcher
 /// and reconciliation, so a race between them counts exactly once.
+///
+/// The persist+metrics pair runs on a detached task, shielding it from
+/// cancellation: callers live inside abortable tasks (the watcher, the
+/// reconciliation sweep — the latter aborted on every stream drop), and an
+/// abort landing between the store write and the metric emission would
+/// persist a resolution whose metrics never fire. Detached, the pair runs to
+/// completion even if the caller is dropped mid-await.
 async fn record_completion(
     store: &Arc<dyn StatusStore>,
     spans: &SpanRegistry,
     root_hex: &str,
     proof_type: &str,
 ) -> Result<Option<ProofResolution>> {
-    let Some(resolution) = store
-        .resolve_proof(root_hex, proof_type, Outcome::Complete, None)
-        .await?
-    else {
-        return Ok(None);
-    };
-    finish_block_span(spans, root_hex, &resolution);
-    counter!(PROOF_COMPLETIONS, "proof_type" => proof_type.to_owned()).increment(1);
-    sync_inflight_gauge(store).await;
-    histogram!(COMPLETION_DURATION, "proof_type" => proof_type.to_owned())
-        .record(resolution.duration_ms as f64 / 1000.0);
-    Ok(Some(resolution))
+    let store = store.clone();
+    let spans = spans.clone();
+    let root_hex = root_hex.to_owned();
+    let proof_type = proof_type.to_owned();
+    tokio::spawn(async move {
+        let Some(resolution) = store
+            .resolve_proof(&root_hex, &proof_type, Outcome::Complete, None)
+            .await?
+        else {
+            return anyhow::Ok(None);
+        };
+        finish_block_span(&spans, &root_hex, &resolution);
+        counter!(PROOF_COMPLETIONS, "proof_type" => proof_type.clone()).increment(1);
+        sync_inflight_gauge(&store).await;
+        histogram!(COMPLETION_DURATION, "proof_type" => proof_type)
+            .record(resolution.duration_ms as f64 / 1000.0);
+        Ok(Some(resolution))
+    })
+    .await
+    .context("proof-completion recording task failed")?
 }
 
 /// Resolves one proof to `Failed` in the store, emitting the failure metrics
 /// when something actually transitioned. Metrics stay labeled by the
 /// low-cardinality reason only; the free-form error text is kept on the
 /// record, never as a label.
+///
+/// Shielded from cancellation the same way as [`record_completion`], and for
+/// the same reason.
 async fn record_failure(
     store: &Arc<dyn StatusStore>,
     spans: &SpanRegistry,
@@ -784,18 +821,25 @@ async fn record_failure(
     proof_type: &str,
     failure: status::Failure,
 ) -> Result<Option<ProofResolution>> {
-    let reason = failure.reason.clone();
-    let Some(resolution) = store
-        .resolve_proof(root_hex, proof_type, Outcome::Failed, Some(failure))
-        .await?
-    else {
-        return Ok(None);
-    };
-    finish_block_span(spans, root_hex, &resolution);
-    counter!(PROOF_FAILURES, "proof_type" => proof_type.to_owned(), "reason" => reason)
-        .increment(1);
-    sync_inflight_gauge(store).await;
-    Ok(Some(resolution))
+    let store = store.clone();
+    let spans = spans.clone();
+    let root_hex = root_hex.to_owned();
+    let proof_type = proof_type.to_owned();
+    tokio::spawn(async move {
+        let reason = failure.reason.clone();
+        let Some(resolution) = store
+            .resolve_proof(&root_hex, &proof_type, Outcome::Failed, Some(failure))
+            .await?
+        else {
+            return anyhow::Ok(None);
+        };
+        finish_block_span(&spans, &root_hex, &resolution);
+        counter!(PROOF_FAILURES, "proof_type" => proof_type, "reason" => reason).increment(1);
+        sync_inflight_gauge(&store).await;
+        Ok(Some(resolution))
+    })
+    .await
+    .context("proof-failure recording task failed")?
 }
 
 /// One reconciliation sweep over proofs still marked sent.
