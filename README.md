@@ -112,11 +112,19 @@ non-optimistic block. Useful flags:
 - `--http-addr HOST:PORT` — serve the dashboard, metrics, and health (below).
 - `--ui-dir DIR` — directory of built dashboard assets to serve.
 - `--download` / `--verify` / `--out-dir` — save and/or verify completed proofs.
-- `--reconcile-after DURATION` — how long a submitted proof may stay unresolved
-  before reconciliation (run whenever the proof-event stream reconnects) marks
-  it failed as `Unresolved` (default `180s`; accepts `s`/`m`/`h` suffixes).
-  Keep it above zkBoost's `witness_timeout` + `proof_timeout` so proofs still
-  being proven are never written off.
+- `--reconcile-after DURATION` — how long a submitted proof may stay silent
+  before reconciliation marks it failed as `Unresolved` (default `900s`;
+  accepts `s`/`m`/`h` suffixes). Budget zkBoost's whole pipeline:
+  `witness_timeout` + worst-case queue wait + `proof_timeout` — the queue wait
+  is unbounded under proving backlog (`proof_timeout` bounds only the prove
+  call), so leave generous headroom. Reconciliation runs when the proof-event
+  stream (re)connects and periodically while connected; silence only counts
+  while zkBoost is observably reachable, and all verdicts are deferred while
+  it is not. Missed *completions* are recovered from zkBoost's replay cache,
+  but that cache holds only the most recent completions (LRU, 128 entries),
+  so an outage spanning more than ~128 completions can still lose outcomes —
+  an upstream zkBoost change to also replay failures is in flight and will be
+  the root fix for missed events.
 
 > **Stream proves one proof type at a time.** The status model tracks each
 > proof type separately, but multi-proof streaming is unexercised end to end

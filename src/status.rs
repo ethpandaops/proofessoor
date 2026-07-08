@@ -307,6 +307,12 @@ pub trait StatusStore: Send + Sync {
     /// eviction without drifting.
     async fn inflight_proofs(&self) -> usize;
 
+    /// Records with at least one unresolved proof, newest slot first.
+    ///
+    /// Lives on the trait so the reconciliation sweep never forces a backend
+    /// to materialize the whole history just to filter it.
+    async fn unresolved_records(&self) -> Vec<BlockRecord>;
+
     /// All recorded requests, newest slot first.
     async fn records(&self) -> Vec<BlockRecord>;
 }
@@ -383,6 +389,18 @@ impl State {
 
     fn snapshot(&self) -> Vec<BlockRecord> {
         let mut records: Vec<BlockRecord> = self.records.values().cloned().collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.slot));
+        records
+    }
+
+    /// Records with at least one unresolved proof, newest slot first.
+    fn unresolved(&self) -> Vec<BlockRecord> {
+        let mut records: Vec<BlockRecord> = self
+            .records
+            .values()
+            .filter(|record| record.proofs.iter().any(|p| p.outcome == Outcome::Sent))
+            .cloned()
+            .collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.slot));
         records
     }
@@ -490,6 +508,10 @@ impl StatusStore for JsonStatusStore {
         self.state.lock().await.inflight_proofs()
     }
 
+    async fn unresolved_records(&self) -> Vec<BlockRecord> {
+        self.state.lock().await.unresolved()
+    }
+
     async fn records(&self) -> Vec<BlockRecord> {
         self.state.lock().await.snapshot()
     }
@@ -544,6 +566,10 @@ impl StatusStore for MemoryStatusStore {
 
     async fn inflight_proofs(&self) -> usize {
         self.state.lock().await.inflight_proofs()
+    }
+
+    async fn unresolved_records(&self) -> Vec<BlockRecord> {
+        self.state.lock().await.unresolved()
     }
 
     async fn records(&self) -> Vec<BlockRecord> {

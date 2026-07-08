@@ -5,9 +5,10 @@
 //! submission keeps pace with block arrival. A separate watcher task observes
 //! zkBoost's proof events, records each proof's outcome in the status registry,
 //! and optionally downloads/verifies completed proofs. Each time the watcher
-//! (re)establishes its subscription it also reconciles proofs still marked
-//! sent, since events that fired while disconnected are not redelivered. The
-//! daemon stops on SIGINT/SIGTERM.
+//! (re)establishes its subscription it reconciles proofs still marked sent —
+//! and keeps re-sweeping them periodically while connected — since events
+//! that fired while disconnected are not redelivered; silence verdicts are
+//! gated on observed zkBoost liveness. The daemon stops on SIGINT/SIGTERM.
 
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
@@ -49,6 +50,15 @@ const RECONCILE_CONCURRENCY: usize = 4;
 /// Replays arrive immediately on connect, so a short window suffices.
 const RECONCILE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound on the cheap liveness request that gates silence verdicts.
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often reconciliation re-sweeps unresolved proofs while the event
+/// stream stays connected. A healthy stream can live for hours, so a proof
+/// whose verdict was deferred on reconnect (too young, zkBoost unreachable)
+/// would otherwise never be revisited.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Failure category for proofs written off by reconciliation. Deliberately one
 /// low-cardinality bucket: a missed failure event and a zkBoost restart that
 /// orphaned the job are indistinguishable from here.
@@ -61,6 +71,27 @@ const UNRESOLVED_REASON: &str = "Unresolved";
 /// drops the handle on the terminal transition, which closes the span for
 /// export. Remaining handles drop with the runner on shutdown.
 type SpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
+
+/// Start of the current observed-liveness streak, as unix milliseconds shared
+/// between the watcher and reconciliation. Zero means zkBoost is not
+/// currently known reachable. Silence verdicts age proofs against this
+/// anchor, so time spent unreachable never counts as silence.
+type LivenessAnchor = Arc<AtomicU64>;
+
+/// Records positive evidence that zkBoost is reachable right now. The anchor
+/// keeps the streak's start, so repeated evidence does not move it.
+fn mark_alive(liveness: &AtomicU64) {
+    if liveness.load(Ordering::Acquire) == 0 {
+        // A benign race between two observers stores near-identical values.
+        liveness.store(status::now_ms().max(1), Ordering::Release);
+    }
+}
+
+/// Resets the liveness streak: reachability must be re-proven before any
+/// further silence verdict, and the streak restarts from that proof.
+fn mark_unreachable(liveness: &AtomicU64) {
+    liveness.store(0, Ordering::Release);
+}
 
 /// The status model tracks proofs per type, but stream mode is restricted to a
 /// single proof type: multi-proof streaming has not been exercised end to end
@@ -558,9 +589,11 @@ fn mark_failed(
 /// Observes proof events, recording outcomes and running artifact actions.
 ///
 /// Reconnects after a transient stream drop; runs until aborted on shutdown.
-/// Every (re)connect — including the first after a restart — also kicks off a
-/// reconciliation pass over proofs still marked sent, since outcomes emitted
-/// while disconnected are not redelivered on the live stream.
+/// Every (re)connect — including the first after a restart — starts a
+/// reconciliation sweep over proofs still marked sent, since outcomes emitted
+/// while disconnected are not redelivered on the live stream; the sweep then
+/// repeats periodically while the subscription lives, so verdicts deferred as
+/// too young (or while zkBoost was unreachable) are eventually revisited.
 async fn watch(
     zkboost: Arc<zkboost::Client>,
     store: Arc<dyn StatusStore>,
@@ -568,17 +601,23 @@ async fn watch(
     spans: SpanRegistry,
     reconcile_after: Duration,
 ) {
+    let liveness: LivenessAnchor = Arc::new(AtomicU64::new(0));
     loop {
         let mut events = Box::pin(zkboost.subscribe_proof_events());
-        let reconciler = tokio::spawn(reconcile(
+        let reconciler = tokio::spawn(reconcile_periodically(
             zkboost.clone(),
             store.clone(),
             spans.clone(),
             reconcile_after,
+            liveness.clone(),
         ));
         while let Some(event) = events.next().await {
             let event = match event {
-                Ok(event) => event,
+                Ok(event) => {
+                    // A delivered event is positive liveness evidence.
+                    mark_alive(&liveness);
+                    event
+                }
                 Err(error) => {
                     warn!(%error, "proof event stream error; reconnecting");
                     break;
@@ -590,10 +629,66 @@ async fn watch(
                 warn!(%error, "failed to handle proof event");
             }
         }
-        // A dropped stream restarts the loop, which reconciles again; the
-        // stale pass would only duplicate that work (idempotently), so stop it.
+        // The connection is gone; the liveness streak ends with it.
+        mark_unreachable(&liveness);
+        // Stop the periodic sweep and wait it out, so a stale pass never
+        // overlaps the one the reconnect starts.
         reconciler.abort();
+        if let Err(error) = reconciler.await
+            && !error.is_cancelled()
+        {
+            warn!(%error, "reconciliation task failed");
+        }
         tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
+/// Runs a reconciliation pass immediately, then repeats every
+/// [`RECONCILE_INTERVAL`] until aborted (when the event stream drops). The
+/// immediate pass picks up outcomes missed while disconnected; the periodic
+/// re-sweep revisits deferred verdicts, which a healthy long-lived stream
+/// would otherwise never trigger again.
+async fn reconcile_periodically(
+    zkboost: Arc<zkboost::Client>,
+    store: Arc<dyn StatusStore>,
+    spans: SpanRegistry,
+    unresolved_after: Duration,
+    liveness: LivenessAnchor,
+) {
+    let mut ticks = tokio::time::interval(RECONCILE_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await; // The first tick fires immediately.
+        reconcile(&zkboost, &store, &spans, unresolved_after, &liveness).await;
+    }
+}
+
+/// Confirms zkBoost is alive right now with a cheap `GET /v1/proof_types`,
+/// updating the liveness anchor either way.
+///
+/// This is the positive evidence silence verdicts require. A per-root probe
+/// cannot supply it: the client consumes the SSE open event internally, so a
+/// hanging endpoint (LB drain, partition without a RST) times out exactly
+/// like a healthy-but-quiet subscription.
+async fn check_liveness(zkboost: &zkboost::Client, liveness: &AtomicU64) -> bool {
+    match tokio::time::timeout(LIVENESS_PROBE_TIMEOUT, zkboost.proof_types()).await {
+        Ok(Ok(_)) => {
+            mark_alive(liveness);
+            true
+        }
+        Ok(Err(error)) => {
+            warn!(%error, "zkBoost liveness check failed");
+            mark_unreachable(liveness);
+            false
+        }
+        Err(_) => {
+            warn!(
+                timeout_s = LIVENESS_PROBE_TIMEOUT.as_secs(),
+                "zkBoost liveness check timed out"
+            );
+            mark_unreachable(liveness);
+            false
+        }
     }
 }
 
@@ -703,58 +798,99 @@ async fn record_failure(
     Ok(Some(resolution))
 }
 
-/// Reconciles proofs still marked sent after the watcher (re)connects.
+/// One reconciliation sweep over proofs still marked sent.
 ///
 /// Outcomes arrive only on zkBoost's live event stream — events that fired
 /// while disconnected are gone. zkBoost does, however, replay its cached
-/// completions when a subscription is opened for a specific root, so each
-/// stuck record is probed with a short-lived per-root subscription; failures
-/// are never replayed, so silence is judged by age. Nothing is resubmitted.
+/// completions when a subscription is opened for a specific root (an LRU of
+/// the most recent completions; failures are never replayed), so each stuck
+/// record is probed with a short-lived per-root subscription, and what stays
+/// silent is judged by age. Every silence verdict is gated on positive
+/// liveness evidence bracketing the probe window: an unreachable or hanging
+/// zkBoost defers all verdicts to a later sweep, because an outage must never
+/// write off a proof whose completion sits unreachable in that cache.
+/// Nothing is ever resubmitted.
 async fn reconcile(
-    zkboost: Arc<zkboost::Client>,
-    store: Arc<dyn StatusStore>,
-    spans: SpanRegistry,
+    zkboost: &zkboost::Client,
+    store: &Arc<dyn StatusStore>,
+    spans: &SpanRegistry,
     unresolved_after: Duration,
+    liveness: &LivenessAnchor,
 ) {
-    let stuck: Vec<BlockRecord> = store
-        .records()
-        .await
-        .into_iter()
-        .filter(|record| record.proofs.iter().any(|p| p.outcome == Outcome::Sent))
-        .collect();
+    let stuck = store.unresolved_records().await;
     if stuck.is_empty() {
         return;
     }
+    // Silence is only evidence while zkBoost is demonstrably reachable.
+    if !check_liveness(zkboost, liveness).await {
+        info!(
+            records = stuck.len(),
+            "zkBoost not reachable; deferring all reconciliation verdicts"
+        );
+        return;
+    }
     info!(records = stuck.len(), "reconciling in-flight proofs");
-    futures::stream::iter(stuck)
-        .for_each_concurrent(RECONCILE_CONCURRENCY, |record| {
-            let zkboost = &zkboost;
-            let store = &store;
-            let spans = &spans;
-            async move {
-                if let Err(error) =
-                    reconcile_record(zkboost, store, spans, &record, unresolved_after).await
-                {
+    let probed: Vec<(BlockRecord, bool)> = futures::stream::iter(stuck)
+        .map(|record| async move {
+            let judgeable = match probe_record(zkboost, store, spans, &record).await {
+                Ok(judgeable) => judgeable,
+                Err(error) => {
                     warn!(
                         root = %record.new_payload_request_root,
                         %error,
-                        "failed to reconcile record"
+                        "failed to probe record; deferring its verdict"
                     );
+                    false
                 }
-            }
+            };
+            (record, judgeable)
         })
+        .buffer_unordered(RECONCILE_CONCURRENCY)
+        .collect()
         .await;
+    // Re-confirm liveness after the probes: a probe window that elapsed in
+    // silence means silence only if zkBoost stayed reachable through it.
+    if !check_liveness(zkboost, liveness).await {
+        info!("zkBoost became unreachable during the probe window; deferring silence verdicts");
+        return;
+    }
+    let alive_since_ms = liveness.load(Ordering::Acquire);
+    let now_ms = status::now_ms();
+    for (record, judgeable) in probed {
+        if !judgeable {
+            continue;
+        }
+        if let Err(error) = resolve_silent_proofs(
+            store,
+            spans,
+            &record,
+            unresolved_after,
+            now_ms,
+            alive_since_ms,
+        )
+        .await
+        {
+            warn!(
+                root = %record.new_payload_request_root,
+                %error,
+                "failed to apply the silence policy"
+            );
+        }
+    }
 }
 
-/// Reconciles a single record: probe for replayed completions, then apply the
-/// silence policy to whatever is still unresolved.
-async fn reconcile_record(
+/// Probes one record's per-root subscription for replayed completions.
+///
+/// Returns whether the record may face the silence policy: `true` when the
+/// probe stayed healthy — everything zkBoost had cached for this root was
+/// seen and recorded — and `false` when the stream erred or a store write
+/// failed, in which case silence proves nothing and judgment is deferred.
+async fn probe_record(
     zkboost: &zkboost::Client,
     store: &Arc<dyn StatusStore>,
     spans: &SpanRegistry,
     record: &BlockRecord,
-    unresolved_after: Duration,
-) -> Result<()> {
+) -> Result<bool> {
     let root_hex = record.new_payload_request_root.as_str();
     let root: Hash256 = root_hex
         .parse()
@@ -775,27 +911,23 @@ async fn reconcile_record(
         pending,
         zkboost.subscribe_root_events(root),
     );
-    // An elapsed window (Err) counts as observed: the subscription stayed
-    // healthy while zkBoost said nothing, which is exactly what the silence
-    // policy judges.
-    let observed = tokio::time::timeout(RECONCILE_PROBE_TIMEOUT, probe)
-        .await
-        .unwrap_or(true);
-    if !observed {
-        // The probe errored before the window closed (e.g. zkBoost is
-        // unreachable), so silence proves nothing — a cached completion may
-        // simply have been unreachable. Leave the record for the next pass.
-        anyhow::bail!("probe stream failed before the replay window closed");
+    match tokio::time::timeout(RECONCILE_PROBE_TIMEOUT, probe).await {
+        Ok(judgeable) => Ok(judgeable),
+        // An elapsed window alone cannot distinguish a quiet healthy
+        // subscription from one that never connected (the client consumes
+        // the SSE open event internally); it counts as observed silence only
+        // because the caller brackets the window with liveness checks.
+        Err(_elapsed) => Ok(true),
     }
-
-    resolve_silent_proofs(store, spans, record, unresolved_after, status::now_ms()).await
 }
 
 /// Applies completions from a per-root probe stream until every pending proof
 /// type resolves or the stream ends (the caller bounds it with a timeout).
 ///
-/// Returns whether zkBoost was actually observed — `false` means the stream
-/// erred, in which case its silence must not be judged.
+/// Returns whether the record may face the silence policy afterward: `false`
+/// means the stream erred (zkBoost was not observed) or a store write failed
+/// (the completion exists but was not applied — judging that proof silent
+/// would write off work known to have finished).
 ///
 /// Only completions are handled: zkBoost never replays failures, and any live
 /// failure racing in here also reaches the main watcher stream, whose
@@ -827,11 +959,15 @@ async fn apply_probe_events(
             continue;
         }
         let proof_type = complete.proof_type.as_str();
-        if !pending.remove(proof_type) {
+        if !pending.contains(proof_type) {
             continue;
         }
+        // A replayed completion counts as handled — and leaves `pending` —
+        // only once its store write is confirmed (or the live stream
+        // demonstrably beat this one to it).
         match record_completion(store, spans, root_hex, proof_type).await {
             Ok(Some(_)) => {
+                pending.remove(proof_type);
                 counter!(RECONCILE_ACTIONS, "verdict" => "complete").increment(1);
                 info!(
                     root = %root_hex,
@@ -841,9 +977,12 @@ async fn apply_probe_events(
                 );
             }
             // The live stream already resolved it — the race is a no-op here.
-            Ok(None) => {}
+            Ok(None) => {
+                pending.remove(proof_type);
+            }
             Err(error) => {
-                warn!(root = %root_hex, proof_type, %error, "failed to record reconciled completion");
+                warn!(root = %root_hex, proof_type, %error, "failed to record a replayed completion");
+                return false;
             }
         }
     }
@@ -851,24 +990,33 @@ async fn apply_probe_events(
     true
 }
 
-/// Applies the silence policy to a record's still-sent proofs: young proofs
-/// are left alone (zkBoost may still be proving them), while proofs older
-/// than the cutoff resolve `Failed`/`Unresolved` — their outcome event is
-/// gone (missed while disconnected, or orphaned by a zkBoost restart) and no
-/// completion is cached, so no event will ever arrive.
+/// Applies the silence policy to a record's still-sent proofs.
+///
+/// Silence only counts while zkBoost is observably alive: each proof ages
+/// from the later of its submission and `alive_since_ms` — the start of the
+/// current observed-liveness streak (`0` means alive since before any
+/// submission). Time zkBoost spent unreachable proves nothing about a proof;
+/// completions from such a window are recovered by the probe replay instead.
+/// Proofs younger than the cutoff are left alone (zkBoost may still be
+/// queueing or proving them), while older ones resolve `Failed`/`Unresolved`
+/// — their outcome event is gone (missed while disconnected, or orphaned by
+/// a zkBoost restart), no completion is cached, and no event will ever
+/// arrive.
 async fn resolve_silent_proofs(
     store: &Arc<dyn StatusStore>,
     spans: &SpanRegistry,
     record: &BlockRecord,
     cutoff: Duration,
     now_ms: u64,
+    alive_since_ms: u64,
 ) -> Result<()> {
     let cutoff_ms = u64::try_from(cutoff.as_millis()).unwrap_or(u64::MAX);
     for proof in &record.proofs {
         if proof.outcome != Outcome::Sent {
             continue;
         }
-        let age_ms = now_ms.saturating_sub(proof.requested_at_ms);
+        let silent_since_ms = proof.requested_at_ms.max(alive_since_ms);
+        let age_ms = now_ms.saturating_sub(silent_since_ms);
         if age_ms < cutoff_ms {
             continue;
         }
@@ -876,8 +1024,8 @@ async fn resolve_silent_proofs(
             stage: FailureStage::Proving,
             reason: UNRESOLVED_REASON.to_owned(),
             error: format!(
-                "no outcome observed within {}s of submission and no completion \
-                 cached at zkBoost; the failure event was missed or the job was lost",
+                "silent for {}s with zkBoost reachable, and no completion \
+                 cached there; the outcome event was missed or the job was lost",
                 cutoff.as_secs()
             ),
         };
@@ -955,13 +1103,15 @@ mod tests {
         let record = sent_record(1_000);
         store.record(record.clone()).await.expect("record");
 
-        // 180s cutoff, and the proof has been silent for exactly that long.
+        // 180s cutoff, and the proof has been silent for exactly that long
+        // with zkBoost observed alive throughout.
         resolve_silent_proofs(
             &store,
             &span_registry(),
             &record,
             Duration::from_secs(180),
             181_000,
+            0,
         )
         .await
         .expect("silence policy");
@@ -986,11 +1136,113 @@ mod tests {
             &record,
             Duration::from_secs(180),
             11_000,
+            0,
         )
         .await
         .expect("silence policy");
 
         assert_eq!(stored_record(&store).await.outcome(), Outcome::Sent);
+    }
+
+    #[tokio::test]
+    async fn silence_ages_from_the_liveness_anchor_not_submission() {
+        let store = memory_store();
+        let record = sent_record(1_000);
+        store.record(record.clone()).await.expect("record");
+
+        // The proof is 499s past submission (cutoff 180s), but zkBoost has
+        // only been observed alive for the last 100s — the earlier silence
+        // proves nothing, so the verdict is deferred.
+        resolve_silent_proofs(
+            &store,
+            &span_registry(),
+            &record,
+            Duration::from_secs(180),
+            500_000,
+            400_000,
+        )
+        .await
+        .expect("silence policy");
+        assert_eq!(stored_record(&store).await.outcome(), Outcome::Sent);
+
+        // With the liveness streak covering a full cutoff of silence, the
+        // proof is judged.
+        resolve_silent_proofs(
+            &store,
+            &span_registry(),
+            &record,
+            Duration::from_secs(180),
+            500_000,
+            200_000,
+        )
+        .await
+        .expect("silence policy");
+        assert_eq!(stored_record(&store).await.outcome(), Outcome::Failed);
+    }
+
+    /// A store whose writes fail, for exercising deferred-judgment paths.
+    struct FailingStore;
+
+    #[async_trait::async_trait]
+    impl StatusStore for FailingStore {
+        async fn seen(&self, _root: &str) -> bool {
+            false
+        }
+
+        async fn record(&self, _record: BlockRecord) -> Result<Vec<String>> {
+            anyhow::bail!("store write failed")
+        }
+
+        async fn resolve_proof(
+            &self,
+            _root: &str,
+            _proof_type: &str,
+            _outcome: Outcome,
+            _failure: Option<status::Failure>,
+        ) -> Result<Option<ProofResolution>> {
+            anyhow::bail!("store write failed")
+        }
+
+        async fn latest_slot(&self) -> Option<u64> {
+            None
+        }
+
+        async fn inflight_proofs(&self) -> usize {
+            0
+        }
+
+        async fn unresolved_records(&self) -> Vec<BlockRecord> {
+            Vec::new()
+        }
+
+        async fn records(&self) -> Vec<BlockRecord> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_store_write_for_a_replayed_completion_defers_judgment() {
+        let store: Arc<dyn StatusStore> = Arc::new(FailingStore);
+        let record = sent_record(1_000);
+
+        // The replayed completion proves the proof finished; failing to
+        // record it must not leave the proof exposed to the silence policy.
+        let root: Hash256 = record.new_payload_request_root.parse().expect("valid root");
+        let replay = futures::stream::iter(vec![Ok(ProofEvent::ProofComplete(ProofComplete {
+            new_payload_request_root: root,
+            proof_type: zkboost::parse_proof_type("reth-zisk").expect("valid proof type"),
+        }))]);
+        let pending: HashSet<String> = ["reth-zisk".to_string()].into();
+        let judgeable = apply_probe_events(
+            &store,
+            &span_registry(),
+            &record.new_payload_request_root,
+            pending,
+            replay,
+        )
+        .await;
+
+        assert!(!judgeable);
     }
 
     #[tokio::test]
@@ -1089,6 +1341,7 @@ mod tests {
             &record,
             Duration::from_secs(0),
             999_000,
+            0,
         )
         .await
         .expect("silence policy");

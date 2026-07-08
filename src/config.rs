@@ -155,12 +155,14 @@ pub struct StreamArgs {
     #[arg(long)]
     pub ui_dir: Option<PathBuf>,
 
-    /// How long a submitted proof may stay unresolved before reconciliation
-    /// (run when the proof-event stream reconnects) marks it failed with
-    /// reason "Unresolved". Set it above zkBoost's witness_timeout +
-    /// proof_timeout so a proof still being proven is never written off.
-    /// Accepts seconds, or a value suffixed with s/m/h (e.g. 180, 300s, 5m).
-    #[arg(long, default_value = "180s", value_parser = parse_duration)]
+    /// How long a submitted proof may stay silent before reconciliation marks
+    /// it failed with reason "Unresolved". Budget zkBoost's whole pipeline:
+    /// witness_timeout + worst-case queue wait + proof_timeout. The queue
+    /// wait is unbounded under proving backlog (proof_timeout bounds only the
+    /// prove call itself), so leave generous headroom. Silence only accrues
+    /// while zkBoost is observably reachable; verdicts are deferred entirely
+    /// while it is not. Accepts seconds, or s/m/h suffixes (e.g. 900, 900s, 15m).
+    #[arg(long, default_value = "900s", value_parser = parse_duration)]
     pub reconcile_after: Duration,
 }
 
