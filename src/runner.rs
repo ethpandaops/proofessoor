@@ -1006,19 +1006,24 @@ async fn reconcile(
         return;
     }
     info!(records = stuck.len(), "reconciling in-flight proofs");
-    let probed: Vec<(BlockRecord, bool)> = futures::stream::iter(stuck)
-        .map(|record| async move {
-            let judgeable = match probe_record(zkboost, store, spans, &record).await {
-                Ok(judgeable) => judgeable,
-                Err(error) => {
-                    warn!(
-                        root = %record.new_payload_request_root,
-                        %error,
-                        "failed to probe record; deferring its verdict"
-                    );
-                    false
-                }
-            };
+    // A stored root that does not parse can never be probed or matched by a
+    // proof event; deferring it would warn-and-retry on every sweep forever.
+    // Such a record is resolved terminally right here instead.
+    let mut probeable: Vec<(BlockRecord, Hash256)> = Vec::with_capacity(stuck.len());
+    for record in stuck {
+        match record.new_payload_request_root.parse::<Hash256>() {
+            Ok(root) => probeable.push((record, root)),
+            Err(error) => {
+                resolve_unprobeable_record(store, spans, &record, &error.to_string()).await;
+            }
+        }
+    }
+    if probeable.is_empty() {
+        return;
+    }
+    let probed: Vec<(BlockRecord, bool)> = futures::stream::iter(probeable)
+        .map(|(record, root)| async move {
+            let judgeable = probe_record(zkboost, store, spans, &record, root).await;
             (record, judgeable)
         })
         .buffer_unordered(RECONCILE_CONCURRENCY)
@@ -1074,6 +1079,64 @@ fn old_enough_to_probe(record: &BlockRecord, now_ms: u64, floor_ms: u64) -> bool
         .is_none_or(|requested| now_ms.saturating_sub(requested) >= floor_ms)
 }
 
+/// Resolves every still-sent proof of a record whose stored request root
+/// does not parse — such a record can never be probed and no proof event can
+/// ever match it, so deferring it (the previous behavior) meant warn-spam on
+/// every sweep forever. It gets one terminal `Failed`/`Unresolved` verdict
+/// carrying the parse error instead. Recorded roots are rendered from parsed
+/// hashes, so this only fires on a corrupted or hand-edited state file.
+async fn resolve_unprobeable_record(
+    store: &Arc<dyn StatusStore>,
+    spans: &SpanRegistry,
+    record: &BlockRecord,
+    detail: &str,
+) {
+    for proof in &record.proofs {
+        if proof.outcome != Outcome::Sent {
+            continue;
+        }
+        let failure = status::Failure {
+            // The defect is in this side's stored record, not evidence about
+            // the prover, so it files as a submit-stage failure.
+            stage: FailureStage::Submit,
+            reason: UNRESOLVED_REASON.to_owned(),
+            error: format!(
+                "stored request root '{}' is not a valid hash ({detail}); \
+                 no proof event can ever resolve it",
+                record.new_payload_request_root
+            ),
+        };
+        match record_failure(
+            store,
+            spans,
+            &record.new_payload_request_root,
+            &proof.proof_type,
+            failure,
+        )
+        .await
+        {
+            Ok(Some(_)) => {
+                counter!(RECONCILE_ACTIONS, "verdict" => "unresolved").increment(1);
+                warn!(
+                    root = %record.new_payload_request_root,
+                    proof_type = %proof.proof_type,
+                    verdict = "unresolved",
+                    "resolved a proof whose stored request root is unparseable"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    root = %record.new_payload_request_root,
+                    proof_type = %proof.proof_type,
+                    %error,
+                    "failed to resolve an unparseable-root record; it will be retried next sweep"
+                );
+            }
+        }
+    }
+}
+
 /// Probes one record's per-root subscription for replayed completions.
 ///
 /// Returns whether the record may face the silence policy: `true` when the
@@ -1085,11 +1148,9 @@ async fn probe_record(
     store: &Arc<dyn StatusStore>,
     spans: &SpanRegistry,
     record: &BlockRecord,
-) -> Result<bool> {
+    root: Hash256,
+) -> bool {
     let root_hex = record.new_payload_request_root.as_str();
-    let root: Hash256 = root_hex
-        .parse()
-        .with_context(|| format!("recorded request root '{root_hex}' is not a valid hash"))?;
     let pending: HashSet<String> = record
         .proofs
         .iter()
@@ -1106,14 +1167,14 @@ async fn probe_record(
         pending,
         zkboost.subscribe_root_events(root),
     );
-    match tokio::time::timeout(RECONCILE_PROBE_TIMEOUT, probe).await {
-        Ok(judgeable) => Ok(judgeable),
-        // An elapsed window alone cannot distinguish a quiet healthy
-        // subscription from one that never connected (the client consumes
-        // the SSE open event internally); it counts as observed silence only
-        // because the caller brackets the window with liveness checks.
-        Err(_elapsed) => Ok(true),
-    }
+    // An elapsed window (the `Err` case, mapped to `true`) alone cannot
+    // distinguish a quiet healthy subscription from one that never connected
+    // (the client consumes the SSE open event internally); it counts as
+    // observed silence only because the caller brackets the window with
+    // liveness checks.
+    tokio::time::timeout(RECONCILE_PROBE_TIMEOUT, probe)
+        .await
+        .unwrap_or(true)
 }
 
 /// Applies completions from a per-root probe stream until every pending proof
@@ -1610,6 +1671,33 @@ mod tests {
         .expect("record completion");
         assert!(result.is_none());
         assert_eq!(stored_record(&store).await.outcome(), Outcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn unparseable_stored_root_is_resolved_once_not_deferred() {
+        let store = memory_store();
+        let mut record = sent_record(1_000);
+        record.new_payload_request_root = "0xnot-a-root".to_string();
+        store.record(record.clone()).await.expect("record");
+
+        resolve_unprobeable_record(&store, &span_registry(), &record, "invalid hex").await;
+
+        let stored = stored_record(&store).await;
+        assert_eq!(stored.outcome(), Outcome::Failed);
+        let proof = stored.proofs.first().expect("one proof");
+        assert_eq!(proof.stage, Some(FailureStage::Submit));
+        assert_eq!(proof.reason.as_deref(), Some(UNRESOLVED_REASON));
+        assert!(
+            proof
+                .error
+                .as_deref()
+                .expect("error detail")
+                .contains("not a valid hash")
+        );
+
+        // Terminal: later sweeps find nothing unresolved, so the record is
+        // never revisited (no warn-spam, no re-judging).
+        assert!(store.unresolved_records().await.is_empty());
     }
 
     #[test]
