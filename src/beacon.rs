@@ -101,9 +101,11 @@ fn build_header_map(headers: &[String]) -> Result<HeaderMap> {
         if trimmed.is_empty() {
             continue;
         }
-        let (name, value) = trimmed.split_once(':').with_context(|| {
-            format!("invalid beacon header '{trimmed}': expected 'Name: Value'")
-        })?;
+        // Never echo the raw entry here: with the colon missing there is no
+        // way to tell name from value, and the value may be a secret (API key).
+        let (name, value) = trimmed.split_once(':').context(
+            "invalid beacon header: expected 'Name: Value' (content redacted; it may contain a secret)",
+        )?;
         let name: HeaderName = name
             .trim()
             .parse()
@@ -230,7 +232,11 @@ mod tests {
     }
 
     #[test]
-    fn build_header_map_rejects_missing_colon() {
-        assert!(build_header_map(&["X-API-Key secret".to_string()]).is_err());
+    fn build_header_map_rejects_missing_colon_without_echoing_the_value() {
+        let error = build_header_map(&["X-API-Key hunter2".to_string()])
+            .expect_err("missing colon must be rejected");
+        // A colonless entry cannot be split into name and value, so the whole
+        // string — possibly a secret — must stay out of the error.
+        assert!(!format!("{error:#}").contains("hunter2"));
     }
 }
