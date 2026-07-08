@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ::metrics::{counter, gauge, histogram};
@@ -72,18 +72,38 @@ const UNRESOLVED_REASON: &str = "Unresolved";
 /// export. Remaining handles drop with the runner on shutdown.
 type SpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 
-/// Start of the current observed-liveness streak, as unix milliseconds shared
-/// between the watcher and reconciliation. Zero means zkBoost is not
-/// currently known reachable. Silence verdicts age proofs against this
-/// anchor, so time spent unreachable never counts as silence.
+/// Start of the current observed-liveness streak, as a [`monotonic_ms`]
+/// reading shared between the watcher and reconciliation. Zero means zkBoost
+/// is not currently known reachable. Silence verdicts age proofs against
+/// this anchor, so time spent unreachable never counts as silence.
+///
+/// Monotonic on purpose: an NTP step or a VM pause landing mid-streak must
+/// not stretch or shrink the observed silence. The residual wall-clock
+/// exposure lives in the proofs' `requested_at_ms`, which stays `SystemTime`
+/// because it is persisted and must remain meaningful across restarts — so
+/// the submission-age half of the silence window can still be skewed by a
+/// clock step across a restart; the streak half, which is what gates
+/// verdicts after an outage, cannot.
 type LivenessAnchor = Arc<AtomicU64>;
+
+/// Milliseconds elapsed on a process-local monotonic clock.
+///
+/// The zero point is the first call, which never matters: only differences
+/// between readings are used. [`Instant`] itself cannot be stored in an
+/// atomic, so streak state shared through [`LivenessAnchor`] uses this
+/// millisecond reading instead.
+fn monotonic_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Records positive evidence that zkBoost is reachable right now. The anchor
 /// keeps the streak's start, so repeated evidence does not move it.
 fn mark_alive(liveness: &AtomicU64) {
     if liveness.load(Ordering::Acquire) == 0 {
         // A benign race between two observers stores near-identical values.
-        liveness.store(status::now_ms().max(1), Ordering::Release);
+        liveness.store(monotonic_ms().max(1), Ordering::Release);
     }
 }
 
@@ -995,7 +1015,16 @@ async fn reconcile(
         info!("zkBoost became unreachable during the probe window; deferring silence verdicts");
         return;
     }
-    let alive_since_ms = liveness.load(Ordering::Acquire);
+    // A zero anchor here means the streak ended between the re-check above
+    // and this load; liveness is not established, so defer everything. The
+    // sweep is stopped and awaited before the watcher zeroes the anchor, so
+    // this should be unreachable — it is kept as defense in depth.
+    let anchor_ms = liveness.load(Ordering::Acquire);
+    if anchor_ms == 0 {
+        info!("liveness anchor cleared during the sweep; deferring silence verdicts");
+        return;
+    }
+    let alive_streak_ms = monotonic_ms().saturating_sub(anchor_ms);
     let now_ms = status::now_ms();
     for (record, judgeable) in probed {
         if !judgeable {
@@ -1007,7 +1036,7 @@ async fn reconcile(
             &record,
             unresolved_after,
             now_ms,
-            alive_since_ms,
+            alive_streak_ms,
         )
         .await
         {
@@ -1133,40 +1162,34 @@ async fn apply_probe_events(
 
 /// Applies the silence policy to a record's still-sent proofs.
 ///
-/// Silence only counts while zkBoost is observably alive: each proof ages
-/// from the later of its submission and `alive_since_ms` — the start of the
-/// current observed-liveness streak. A zeroed anchor means liveness is *not*
-/// currently established, so every verdict is deferred. Time zkBoost spent
-/// unreachable proves nothing about a proof; completions from such a window
-/// are recovered by the probe replay instead. Proofs younger than the cutoff
-/// are left alone (zkBoost may still be queueing or proving them), while
-/// older ones resolve `Failed`/`Unresolved` — their outcome event is gone
-/// (missed while disconnected, or orphaned by a zkBoost restart), no
-/// completion is cached, and no event will ever arrive.
+/// A proof's observed silence is the overlap of two windows: how long it has
+/// been waiting since submission (wall clock — `requested_at_ms` is persisted
+/// with the record, so it spans restarts) and how long zkBoost has been
+/// continuously observed alive (`alive_streak_ms`, monotonic — an NTP step or
+/// VM pause cannot stretch it). Time zkBoost spent unreachable proves nothing
+/// about a proof; completions from such a window are recovered by the probe
+/// replay instead, and a zero streak defers every verdict by construction.
+/// Proofs whose silence is shorter than the cutoff are left alone (zkBoost
+/// may still be queueing or proving them), while the rest resolve
+/// `Failed`/`Unresolved` — their outcome event is gone (missed while
+/// disconnected, or orphaned by a zkBoost restart), no completion is cached,
+/// and no event will ever arrive.
 async fn resolve_silent_proofs(
     store: &Arc<dyn StatusStore>,
     spans: &SpanRegistry,
     record: &BlockRecord,
     cutoff: Duration,
     now_ms: u64,
-    alive_since_ms: u64,
+    alive_streak_ms: u64,
 ) -> Result<()> {
-    // The watcher zeroes the anchor when the event stream drops. The sweep is
-    // stopped and awaited before that happens, so reading 0 here should be
-    // impossible — but if it is ever observed, it means reachability is no
-    // longer established, never "alive since forever" (which would hand out
-    // maximum-age silence verdicts at the worst possible moment).
-    if alive_since_ms == 0 {
-        return Ok(());
-    }
     let cutoff_ms = u64::try_from(cutoff.as_millis()).unwrap_or(u64::MAX);
     for proof in &record.proofs {
         if proof.outcome != Outcome::Sent {
             continue;
         }
-        let silent_since_ms = proof.requested_at_ms.max(alive_since_ms);
-        let age_ms = now_ms.saturating_sub(silent_since_ms);
-        if age_ms < cutoff_ms {
+        let waited_ms = now_ms.saturating_sub(proof.requested_at_ms);
+        let silent_ms = waited_ms.min(alive_streak_ms);
+        if silent_ms < cutoff_ms {
             continue;
         }
         let failure = status::Failure {
@@ -1196,7 +1219,7 @@ async fn resolve_silent_proofs(
                 root = %record.new_payload_request_root,
                 proof_type = %proof.proof_type,
                 verdict = "unresolved",
-                age_ms,
+                silent_ms,
                 "reconciled proof as unresolved"
             );
         }
@@ -1253,14 +1276,14 @@ mod tests {
         store.record(record.clone()).await.expect("record");
 
         // 180s cutoff, and the proof has been silent for exactly that long
-        // with zkBoost observed alive throughout (anchor predates submission).
+        // with zkBoost observed alive throughout the wait.
         resolve_silent_proofs(
             &store,
             &span_registry(),
             &record,
             Duration::from_secs(180),
             181_000,
-            1,
+            180_000,
         )
         .await
         .expect("silence policy");
@@ -1285,7 +1308,7 @@ mod tests {
             &record,
             Duration::from_secs(180),
             11_000,
-            1,
+            1_000_000,
         )
         .await
         .expect("silence policy");
@@ -1294,13 +1317,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zeroed_liveness_anchor_defers_every_verdict() {
+    async fn zero_liveness_streak_defers_every_verdict() {
         let store = memory_store();
         let record = sent_record(1_000);
         store.record(record.clone()).await.expect("record");
 
-        // Ancient silence, but the anchor is zeroed: liveness is not
-        // established, so nothing may be judged — 0 must never read as
+        // Ancient silence, but zkBoost has no observed-liveness streak at
+        // all: nothing may be judged — a missing streak must never read as
         // "alive since forever".
         resolve_silent_proofs(
             &store,
@@ -1317,7 +1340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn silence_ages_from_the_liveness_anchor_not_submission() {
+    async fn silence_is_bounded_by_the_liveness_streak_not_submission_age() {
         let store = memory_store();
         let record = sent_record(1_000);
         store.record(record.clone()).await.expect("record");
@@ -1331,7 +1354,7 @@ mod tests {
             &record,
             Duration::from_secs(180),
             500_000,
-            400_000,
+            100_000,
         )
         .await
         .expect("silence policy");
@@ -1345,7 +1368,7 @@ mod tests {
             &record,
             Duration::from_secs(180),
             500_000,
-            200_000,
+            300_000,
         )
         .await
         .expect("silence policy");
