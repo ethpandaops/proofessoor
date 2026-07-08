@@ -22,21 +22,21 @@ use futures::{Stream, StreamExt};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{Instrument, Span, field, info, info_span, warn};
+use tracing::{Instrument, Span, debug, field, info, info_span, warn};
 use zkboost_client::{Hash256, ProofType};
 
 use crate::beacon::{self, BlockEvent};
 use crate::config::{BlockId, StreamArgs};
 use crate::metrics::{
     BLOCKS_OBSERVED, BLOCKS_SKIPPED, COMPLETION_DURATION, HEAD_LAG, INFLIGHT_REQUESTS,
-    LATEST_REQUESTED_SLOT, LATEST_SEEN_SLOT, PROOF_COMPLETIONS, PROOF_FAILURES,
-    PROOF_REQUEST_FAILURES, PROOF_REQUESTS, RECONCILE_ACTIONS, REQUEST_DURATION,
+    LATE_EVENTS_DISCARDED, LATEST_REQUESTED_SLOT, LATEST_SEEN_SLOT, PROOF_COMPLETIONS,
+    PROOF_FAILURES, PROOF_REQUEST_FAILURES, PROOF_REQUESTS, RECONCILE_ACTIONS, REQUEST_DURATION,
     REQUEST_STAGE_DURATION,
 };
 use crate::request;
 use crate::status::{
     self, BlockRecord, FailureStage, JsonStatusStore, MemoryStatusStore, Outcome, ProofResolution,
-    StatusStore,
+    ResolveOutcome, StatusStore,
 };
 use crate::zkboost::{self, ProofEvent};
 
@@ -790,11 +790,22 @@ async fn record_completion(
     let root_hex = root_hex.to_owned();
     let proof_type = proof_type.to_owned();
     tokio::spawn(async move {
-        let Some(resolution) = store
+        let resolution = match store
             .resolve_proof(&root_hex, &proof_type, Outcome::Complete, None)
             .await?
-        else {
-            return anyhow::Ok(None);
+        {
+            ResolveOutcome::Transitioned(resolution) => resolution,
+            ResolveOutcome::AlreadyResolved(prior) => {
+                note_late_event(
+                    &root_hex,
+                    &proof_type,
+                    "completion",
+                    Outcome::Complete,
+                    prior,
+                );
+                return anyhow::Ok(None);
+            }
+            ResolveOutcome::Unknown => return anyhow::Ok(None),
         };
         finish_block_span(&spans, &root_hex, &resolution);
         counter!(PROOF_COMPLETIONS, "proof_type" => proof_type.clone()).increment(1);
@@ -827,11 +838,16 @@ async fn record_failure(
     let proof_type = proof_type.to_owned();
     tokio::spawn(async move {
         let reason = failure.reason.clone();
-        let Some(resolution) = store
+        let resolution = match store
             .resolve_proof(&root_hex, &proof_type, Outcome::Failed, Some(failure))
             .await?
-        else {
-            return anyhow::Ok(None);
+        {
+            ResolveOutcome::Transitioned(resolution) => resolution,
+            ResolveOutcome::AlreadyResolved(prior) => {
+                note_late_event(&root_hex, &proof_type, "failure", Outcome::Failed, prior);
+                return anyhow::Ok(None);
+            }
+            ResolveOutcome::Unknown => return anyhow::Ok(None),
         };
         finish_block_span(&spans, &root_hex, &resolution);
         counter!(PROOF_FAILURES, "proof_type" => proof_type, "reason" => reason).increment(1);
@@ -840,6 +856,44 @@ async fn record_failure(
     })
     .await
     .context("proof-failure recording task failed")?
+}
+
+/// Makes a discarded late event observable instead of silently dropping it.
+///
+/// The single-transition rule means a proof event landing on an already
+/// resolved proof changes nothing — correct for duplicate deliveries, but it
+/// would also silently eat the one case that matters: a real outcome arriving
+/// *after* reconciliation already wrote the proof off (a false `Unresolved`
+/// or a missed failure). Every discard counts toward the metric; a discard
+/// that contradicts the recorded outcome — the stored verdict is now known
+/// wrong — logs at warn, while a same-outcome duplicate (e.g. a probe replay
+/// racing the live stream) stays at debug.
+fn note_late_event(
+    root_hex: &str,
+    proof_type: &str,
+    kind: &'static str,
+    arrived: Outcome,
+    prior: Outcome,
+) {
+    counter!(LATE_EVENTS_DISCARDED, "kind" => kind).increment(1);
+    if arrived == prior {
+        debug!(
+            root = %root_hex,
+            proof_type,
+            kind,
+            prior_outcome = prior.as_str(),
+            "discarded a duplicate proof event for an already-resolved proof"
+        );
+    } else {
+        warn!(
+            root = %root_hex,
+            proof_type,
+            kind,
+            prior_outcome = prior.as_str(),
+            "discarded a late proof event that contradicts the recorded outcome; \
+             the stored verdict for this proof is wrong"
+        );
+    }
 }
 
 /// One reconciliation sweep over proofs still marked sent.
@@ -1243,7 +1297,7 @@ mod tests {
             _proof_type: &str,
             _outcome: Outcome,
             _failure: Option<status::Failure>,
-        ) -> Result<Option<ProofResolution>> {
+        ) -> Result<ResolveOutcome> {
             anyhow::bail!("store write failed")
         }
 
@@ -1353,6 +1407,7 @@ mod tests {
             )
             .await
             .expect("resolve proof")
+            .transitioned()
             .expect("transitioned");
         let resolved_at = stored_record(&store)
             .await
@@ -1395,6 +1450,44 @@ mod tests {
         let proof = stored.proofs.first().expect("one proof");
         assert_eq!(proof.resolved_at_ms, resolved_at);
         assert_eq!(proof.reason, None);
+    }
+
+    #[tokio::test]
+    async fn late_completion_after_a_verdict_is_discarded_not_applied() {
+        let store = memory_store();
+        let record = sent_record(1_000);
+        store.record(record.clone()).await.expect("record");
+
+        // Reconciliation writes the proof off first (a false verdict).
+        store
+            .resolve_proof(
+                &record.new_payload_request_root,
+                "reth-zisk",
+                Outcome::Failed,
+                Some(status::Failure {
+                    stage: FailureStage::Proving,
+                    reason: UNRESOLVED_REASON.to_owned(),
+                    error: "silent past the cutoff".to_owned(),
+                }),
+            )
+            .await
+            .expect("resolve proof")
+            .transitioned()
+            .expect("transitioned");
+
+        // The real completion arriving afterwards must not flip the record
+        // (single-transition rule), and must report that nothing transitioned
+        // — note_late_event makes the discard observable on this path.
+        let result = record_completion(
+            &store,
+            &span_registry(),
+            &record.new_payload_request_root,
+            "reth-zisk",
+        )
+        .await
+        .expect("record completion");
+        assert!(result.is_none());
+        assert_eq!(stored_record(&store).await.outcome(), Outcome::Failed);
     }
 
     #[test]

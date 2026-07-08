@@ -271,6 +271,37 @@ pub struct ProofResolution {
     pub block_resolved: bool,
 }
 
+/// What [`StatusStore::resolve_proof`] did — or why it did nothing.
+///
+/// The no-op cases are deliberately distinguished: an event for a root or
+/// proof type that was never recorded is routine noise (other requestors
+/// share the event stream), while an event for an *already-resolved* proof
+/// means an outcome arrived after the single-transition rule locked the
+/// record — most importantly the truth arriving after reconciliation wrote a
+/// false verdict. Callers must be able to see the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveOutcome {
+    /// The proof transitioned from `Sent` to the requested terminal outcome.
+    Transitioned(ProofResolution),
+    /// The proof already carries the given terminal outcome; nothing changed.
+    AlreadyResolved(Outcome),
+    /// The root is not recorded, or that proof type was not requested.
+    Unknown,
+}
+
+#[cfg(test)]
+impl ResolveOutcome {
+    /// The resolution when a transition actually happened, `None` otherwise.
+    /// Test-only sugar: production callers match on the variants, because
+    /// each no-op case needs its own handling.
+    pub fn transitioned(self) -> Option<ProofResolution> {
+        match self {
+            Self::Transitioned(resolution) => Some(resolution),
+            Self::AlreadyResolved(_) | Self::Unknown => None,
+        }
+    }
+}
+
 /// A narrow, swappable interface for persisting request status.
 #[async_trait]
 pub trait StatusStore: Send + Sync {
@@ -286,16 +317,17 @@ pub trait StatusStore: Send + Sync {
 
     /// Resolves one proof of a recorded request to a terminal outcome.
     ///
-    /// Returns `None` when there is nothing to transition: the root is not
-    /// recorded, the proof type was not requested, or the proof already
-    /// resolved (duplicate events are ignored, keeping this idempotent).
+    /// Only a proof still marked sent transitions, keeping this idempotent.
+    /// The no-op cases are reported distinctly (see [`ResolveOutcome`]): an
+    /// unknown root or proof type is routine, while an already-resolved proof
+    /// means a late event was discarded and the caller should surface it.
     async fn resolve_proof(
         &self,
         root: &str,
         proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
-    ) -> Result<Option<ProofResolution>>;
+    ) -> Result<ResolveOutcome>;
 
     /// The highest slot recorded so far, if any.
     async fn latest_slot(&self) -> Option<u64>;
@@ -347,14 +379,24 @@ impl State {
         proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
-    ) -> Option<ProofResolution> {
-        let record = self.records.get_mut(root)?;
-        // Only a still-sent proof can transition; a repeated terminal event
-        // (e.g. a reconciliation racing the live stream) is a no-op.
-        let proof = record
+    ) -> ResolveOutcome {
+        let Some(record) = self.records.get_mut(root) else {
+            return ResolveOutcome::Unknown;
+        };
+        let Some(proof) = record
             .proofs
             .iter_mut()
-            .find(|proof| proof.proof_type == proof_type && proof.outcome == Outcome::Sent)?;
+            .find(|proof| proof.proof_type == proof_type)
+        else {
+            return ResolveOutcome::Unknown;
+        };
+        // Only a still-sent proof can transition; a repeated terminal event
+        // (e.g. a reconciliation racing the live stream) is a no-op, but the
+        // prior outcome is reported so the caller can tell a benign duplicate
+        // from an outcome arriving after the record was already judged.
+        if proof.outcome != Outcome::Sent {
+            return ResolveOutcome::AlreadyResolved(proof.outcome);
+        }
         let now = now_ms();
         proof.outcome = outcome;
         if let Some(failure) = failure {
@@ -364,7 +406,7 @@ impl State {
         }
         proof.resolved_at_ms = Some(now);
         let duration_ms = now.saturating_sub(proof.requested_at_ms);
-        Some(ProofResolution {
+        ResolveOutcome::Transitioned(ProofResolution {
             duration_ms,
             block_outcome: record.outcome(),
             block_resolved: record
@@ -490,11 +532,11 @@ impl StatusStore for JsonStatusStore {
         proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
-    ) -> Result<Option<ProofResolution>> {
+    ) -> Result<ResolveOutcome> {
         let mut state = self.state.lock().await;
         let resolution = state.resolve_proof(root, proof_type, outcome, failure);
         // Persist only when something transitioned; no-op events cost no I/O.
-        if resolution.is_some() {
+        if matches!(resolution, ResolveOutcome::Transitioned(_)) {
             self.persist(&state).await?;
         }
         Ok(resolution)
@@ -552,7 +594,7 @@ impl StatusStore for MemoryStatusStore {
         proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
-    ) -> Result<Option<ProofResolution>> {
+    ) -> Result<ResolveOutcome> {
         Ok(self
             .state
             .lock()
@@ -707,6 +749,7 @@ mod tests {
             .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
             .await
             .expect("resolve proof")
+            .transitioned()
             .expect("transitioned");
         assert_eq!(resolution.block_outcome, Outcome::Sent);
         assert!(!resolution.block_resolved);
@@ -725,6 +768,7 @@ mod tests {
             )
             .await
             .expect("resolve proof")
+            .transitioned()
             .expect("transitioned");
         assert_eq!(resolution.block_outcome, Outcome::Failed);
         assert!(resolution.block_resolved);
@@ -740,42 +784,80 @@ mod tests {
         let store = MemoryStatusStore::new(0);
         store.record(record(500, "0xroot")).await.expect("record");
 
-        // Unknown root and unrequested proof type transition nothing.
-        assert!(
+        // Unknown root and unrequested proof type transition nothing, and are
+        // reported as unknown (routine noise, not a discarded late event).
+        assert_eq!(
             store
                 .resolve_proof("0xother", "reth-zisk", Outcome::Complete, None)
                 .await
-                .expect("resolve proof")
-                .is_none()
+                .expect("resolve proof"),
+            ResolveOutcome::Unknown
         );
-        assert!(
+        assert_eq!(
             store
                 .resolve_proof("0xroot", "ethrex-sp1", Outcome::Complete, None)
                 .await
-                .expect("resolve proof")
-                .is_none()
+                .expect("resolve proof"),
+            ResolveOutcome::Unknown
         );
 
-        // First terminal event transitions; a duplicate is a no-op.
+        // First terminal event transitions; a duplicate is a no-op that
+        // reports the outcome already recorded.
         assert!(
             store
                 .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
                 .await
                 .expect("resolve proof")
+                .transitioned()
                 .is_some()
         );
-        assert!(
+        assert_eq!(
             store
                 .resolve_proof("0xroot", "reth-zisk", Outcome::Failed, None)
                 .await
-                .expect("resolve proof")
-                .is_none()
+                .expect("resolve proof"),
+            ResolveOutcome::AlreadyResolved(Outcome::Complete)
         );
 
         let records = store.records().await;
         assert_eq!(
             records.first().expect("one record").outcome(),
             Outcome::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn late_completion_reports_the_prior_failed_outcome() {
+        let store = MemoryStatusStore::new(0);
+        store.record(record(550, "0xroot")).await.expect("record");
+
+        // Reconciliation (or a real failure event) resolves the proof first.
+        store
+            .resolve_proof(
+                "0xroot",
+                "reth-zisk",
+                Outcome::Failed,
+                Some(Failure {
+                    stage: FailureStage::Proving,
+                    reason: "Unresolved".to_string(),
+                    error: "silent past the cutoff".to_string(),
+                }),
+            )
+            .await
+            .expect("resolve proof");
+
+        // The truth arriving afterwards is discarded, but the caller learns
+        // exactly which verdict it contradicts.
+        assert_eq!(
+            store
+                .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+                .await
+                .expect("resolve proof"),
+            ResolveOutcome::AlreadyResolved(Outcome::Failed)
+        );
+        assert_eq!(
+            store.records().await.first().expect("one record").outcome(),
+            Outcome::Failed
         );
     }
 
