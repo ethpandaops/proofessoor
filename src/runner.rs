@@ -93,6 +93,36 @@ fn mark_unreachable(liveness: &AtomicU64) {
     liveness.store(0, Ordering::Release);
 }
 
+/// Shared handle to the currently running periodic reconciler.
+///
+/// The reconciler is spawned inside `watch()`, but `watch()` itself is
+/// stopped by abort on shutdown — an abort drops the watch future without
+/// running any of its code, so a watch-local `JoinHandle` would simply be
+/// dropped and the sweep would keep running detached, resolving proofs after
+/// the otel provider has flushed. Holding the handle in a slot shared with
+/// [`run`] lets every cancellation path abort *and await* the sweep.
+type ReconcilerSlot = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
+/// Aborts and awaits the reconciler currently in the slot, if any.
+///
+/// Both `watch()` (on every stream drop) and `run()` (on shutdown, after the
+/// watcher is awaited) call this; `Option::take` under the lock guarantees
+/// exactly one caller awaits a given sweep. Resolutions already handed to the
+/// detached recording tasks still land — that shield is deliberate and
+/// bounded — but no *new* sweep work starts after this returns.
+async fn stop_reconciler(slot: &ReconcilerSlot) {
+    let handle = slot.lock().ok().and_then(|mut slot| slot.take());
+    let Some(handle) = handle else {
+        return;
+    };
+    handle.abort();
+    if let Err(error) = handle.await
+        && !error.is_cancelled()
+    {
+        warn!(%error, "reconciliation task failed");
+    }
+}
+
 /// The status model tracks proofs per type, but stream mode is restricted to a
 /// single proof type: multi-proof streaming has not been exercised end to end
 /// (dashboard aggregation, per-type failure display), and proving several
@@ -147,12 +177,14 @@ pub async fn run(args: StreamArgs) -> Result<()> {
     let spans: SpanRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // Observe proof outcomes (and run artifact actions) independently of submission.
+    let reconciler: ReconcilerSlot = Arc::new(Mutex::new(None));
     let watcher = tokio::spawn(watch(
         zkboost.clone(),
         store.clone(),
         artifacts.clone(),
         spans.clone(),
         args.reconcile_after,
+        reconciler.clone(),
     ));
 
     let http_server = match args.http_addr {
@@ -292,6 +324,11 @@ pub async fn run(args: StreamArgs) -> Result<()> {
     {
         warn!(%error, "watcher task failed during shutdown");
     }
+    // Aborting the watcher drops its future without running its cleanup, so
+    // the reconciler it spawned must be stopped here too — otherwise the
+    // sweep would outlive the runner and keep resolving proofs after the
+    // otel flush in main.
+    stop_reconciler(&reconciler).await;
     if let Some(server) = http_server {
         server.abort();
         if let Err(error) = server.await
@@ -619,17 +656,23 @@ async fn watch(
     artifacts: Arc<zkboost::Artifacts>,
     spans: SpanRegistry,
     reconcile_after: Duration,
+    reconciler: ReconcilerSlot,
 ) {
     let liveness: LivenessAnchor = Arc::new(AtomicU64::new(0));
     loop {
         let mut events = Box::pin(zkboost.subscribe_proof_events());
-        let reconciler = tokio::spawn(reconcile_periodically(
+        let sweep = tokio::spawn(reconcile_periodically(
             zkboost.clone(),
             store.clone(),
             spans.clone(),
             reconcile_after,
             liveness.clone(),
         ));
+        match reconciler.lock() {
+            Ok(mut slot) => *slot = Some(sweep),
+            // A poisoned slot cannot track the sweep; never let it run detached.
+            Err(_) => sweep.abort(),
+        }
         while let Some(event) = events.next().await {
             let event = match event {
                 Ok(event) => {
@@ -648,16 +691,16 @@ async fn watch(
                 warn!(%error, "failed to handle proof event");
             }
         }
+        // Stop the periodic sweep and wait it out BEFORE ending the liveness
+        // streak. The reverse order had a race: a sweep that had already
+        // passed its liveness re-check could load the just-zeroed anchor,
+        // read it as "alive since forever", and hand every stuck proof a
+        // maximum-age silence verdict at the exact moment the stream died.
+        // Awaiting first also guarantees a stale pass never overlaps the one
+        // the reconnect starts.
+        stop_reconciler(&reconciler).await;
         // The connection is gone; the liveness streak ends with it.
         mark_unreachable(&liveness);
-        // Stop the periodic sweep and wait it out, so a stale pass never
-        // overlaps the one the reconnect starts.
-        reconciler.abort();
-        if let Err(error) = reconciler.await
-            && !error.is_cancelled()
-        {
-            warn!(%error, "reconciliation task failed");
-        }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
 }
@@ -1092,14 +1135,14 @@ async fn apply_probe_events(
 ///
 /// Silence only counts while zkBoost is observably alive: each proof ages
 /// from the later of its submission and `alive_since_ms` — the start of the
-/// current observed-liveness streak (`0` means alive since before any
-/// submission). Time zkBoost spent unreachable proves nothing about a proof;
-/// completions from such a window are recovered by the probe replay instead.
-/// Proofs younger than the cutoff are left alone (zkBoost may still be
-/// queueing or proving them), while older ones resolve `Failed`/`Unresolved`
-/// — their outcome event is gone (missed while disconnected, or orphaned by
-/// a zkBoost restart), no completion is cached, and no event will ever
-/// arrive.
+/// current observed-liveness streak. A zeroed anchor means liveness is *not*
+/// currently established, so every verdict is deferred. Time zkBoost spent
+/// unreachable proves nothing about a proof; completions from such a window
+/// are recovered by the probe replay instead. Proofs younger than the cutoff
+/// are left alone (zkBoost may still be queueing or proving them), while
+/// older ones resolve `Failed`/`Unresolved` — their outcome event is gone
+/// (missed while disconnected, or orphaned by a zkBoost restart), no
+/// completion is cached, and no event will ever arrive.
 async fn resolve_silent_proofs(
     store: &Arc<dyn StatusStore>,
     spans: &SpanRegistry,
@@ -1108,6 +1151,14 @@ async fn resolve_silent_proofs(
     now_ms: u64,
     alive_since_ms: u64,
 ) -> Result<()> {
+    // The watcher zeroes the anchor when the event stream drops. The sweep is
+    // stopped and awaited before that happens, so reading 0 here should be
+    // impossible — but if it is ever observed, it means reachability is no
+    // longer established, never "alive since forever" (which would hand out
+    // maximum-age silence verdicts at the worst possible moment).
+    if alive_since_ms == 0 {
+        return Ok(());
+    }
     let cutoff_ms = u64::try_from(cutoff.as_millis()).unwrap_or(u64::MAX);
     for proof in &record.proofs {
         if proof.outcome != Outcome::Sent {
@@ -1202,14 +1253,14 @@ mod tests {
         store.record(record.clone()).await.expect("record");
 
         // 180s cutoff, and the proof has been silent for exactly that long
-        // with zkBoost observed alive throughout.
+        // with zkBoost observed alive throughout (anchor predates submission).
         resolve_silent_proofs(
             &store,
             &span_registry(),
             &record,
             Duration::from_secs(180),
             181_000,
-            0,
+            1,
         )
         .await
         .expect("silence policy");
@@ -1234,6 +1285,29 @@ mod tests {
             &record,
             Duration::from_secs(180),
             11_000,
+            1,
+        )
+        .await
+        .expect("silence policy");
+
+        assert_eq!(stored_record(&store).await.outcome(), Outcome::Sent);
+    }
+
+    #[tokio::test]
+    async fn zeroed_liveness_anchor_defers_every_verdict() {
+        let store = memory_store();
+        let record = sent_record(1_000);
+        store.record(record.clone()).await.expect("record");
+
+        // Ancient silence, but the anchor is zeroed: liveness is not
+        // established, so nothing may be judged — 0 must never read as
+        // "alive since forever".
+        resolve_silent_proofs(
+            &store,
+            &span_registry(),
+            &record,
+            Duration::from_secs(180),
+            999_000_000,
             0,
         )
         .await
@@ -1440,7 +1514,7 @@ mod tests {
             &record,
             Duration::from_secs(0),
             999_000,
-            0,
+            1,
         )
         .await
         .expect("silence policy");
