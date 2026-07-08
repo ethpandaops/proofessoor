@@ -137,6 +137,10 @@ pub async fn run(args: StreamArgs) -> Result<()> {
         }
         None => None,
     };
+    // Seed the inflight gauge from loaded state now that the recorder exists;
+    // starting from the recorder's implicit zero would send the gauge negative
+    // as soon as reconciliation resolves proofs recorded by a previous run.
+    sync_inflight_gauge(&store).await;
 
     let mut sigterm =
         signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
@@ -350,7 +354,8 @@ async fn submit_block(
                 format!("{error:#}"),
             );
             record.trace_id = trace_id;
-            store.record(record).await?;
+            let evicted = store.record(record).await?;
+            close_evicted_spans(spans, &evicted);
             span.record("outcome", "failed");
             warn!(slot = fetched.slot(), root = %local_root, %error, "proof submission failed");
             return Ok(());
@@ -374,7 +379,8 @@ async fn submit_block(
             format!("local {local_root} != server {server_root}"),
         );
         record.trace_id = trace_id;
-        store.record(record).await?;
+        let evicted = store.record(record).await?;
+        close_evicted_spans(spans, &evicted);
         span.record("outcome", "failed");
         warn!(
             slot = fetched.slot(),
@@ -387,7 +393,6 @@ async fn submit_block(
 
     latest_requested.fetch_max(fetched.slot(), Ordering::Relaxed);
     counter!(PROOF_REQUESTS).increment(1);
-    gauge!(INFLIGHT_REQUESTS).increment(proof_types.len() as f64);
     gauge!(LATEST_REQUESTED_SLOT).set(fetched.slot() as f64);
     histogram!(REQUEST_DURATION).record(start.elapsed().as_secs_f64());
 
@@ -405,10 +410,14 @@ async fn submit_block(
     // Hold the span open before the record lands, so the watcher can never
     // resolve a record whose span handle is not registered yet.
     register_span(spans, root_hex.clone(), span.clone());
-    if let Err(error) = store.record(record).await {
-        drop_span(spans, &root_hex);
-        return Err(error);
+    match store.record(record).await {
+        Ok(evicted) => close_evicted_spans(spans, &evicted),
+        Err(error) => {
+            drop_span(spans, &root_hex);
+            return Err(error);
+        }
     }
+    sync_inflight_gauge(store).await;
 
     info!(
         slot = fetched.slot(),
@@ -455,6 +464,35 @@ fn drop_span(spans: &SpanRegistry, root_hex: &str) {
     if let Ok(mut map) = spans.lock() {
         map.remove(root_hex);
     }
+}
+
+/// Closes the span handles of records evicted from the store's history cap.
+///
+/// An evicted record may still be unresolved; without this its root span
+/// would stay open (and leak) until shutdown. Resolved records were already
+/// removed from the registry on their terminal transition, so most evictions
+/// are no-ops here.
+fn close_evicted_spans(spans: &SpanRegistry, evicted: &[String]) {
+    if evicted.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = spans.lock() {
+        for root in evicted {
+            if let Some(span) = map.remove(root) {
+                span.record("outcome", "evicted");
+            }
+        }
+    }
+}
+
+/// Sets the inflight gauge absolutely from store state.
+///
+/// A state-derived gauge cannot drift: restarts (which reset the recorder to
+/// zero) and history eviction (which can drop still-unresolved proofs) are
+/// both reflected on the next set, where event deltas would leave the gauge
+/// negative or permanently inflated.
+async fn sync_inflight_gauge(store: &Arc<dyn StatusStore>) {
+    gauge!(INFLIGHT_REQUESTS).set(store.inflight_proofs().await as f64);
 }
 
 /// On a block's terminal transition, records the derived outcome on its root
@@ -634,7 +672,7 @@ async fn record_completion(
     };
     finish_block_span(spans, root_hex, &resolution);
     counter!(PROOF_COMPLETIONS, "proof_type" => proof_type.to_owned()).increment(1);
-    gauge!(INFLIGHT_REQUESTS).decrement(1.0);
+    sync_inflight_gauge(store).await;
     histogram!(COMPLETION_DURATION, "proof_type" => proof_type.to_owned())
         .record(resolution.duration_ms as f64 / 1000.0);
     Ok(Some(resolution))
@@ -661,7 +699,7 @@ async fn record_failure(
     finish_block_span(spans, root_hex, &resolution);
     counter!(PROOF_FAILURES, "proof_type" => proof_type.to_owned(), "reason" => reason)
         .increment(1);
-    gauge!(INFLIGHT_REQUESTS).decrement(1.0);
+    sync_inflight_gauge(store).await;
     Ok(Some(resolution))
 }
 
@@ -1102,6 +1140,44 @@ mod tests {
         // Identity fields from the base record are preserved.
         assert_eq!(failed.slot, 100);
         assert_eq!(failed.new_payload_request_root, "0xroot");
+    }
+
+    #[tokio::test]
+    async fn eviction_closes_the_evicted_records_span_handle() {
+        let store: Arc<dyn StatusStore> = Arc::new(MemoryStatusStore::new(1));
+        let spans = span_registry();
+
+        let old = BlockRecord::new(
+            100,
+            "0xbeacon".to_string(),
+            99,
+            "0xexechash".to_string(),
+            "0xold".to_string(),
+            vec!["reth-zisk".to_string()],
+            1_000,
+        );
+        register_span(
+            &spans,
+            "0xold".to_string(),
+            prove_block_span(100, "0xbeacon"),
+        );
+        let evicted = store.record(old).await.expect("record");
+        assert!(evicted.is_empty());
+
+        // A newer record over the history cap evicts the old unresolved one;
+        // its span handle must not outlive the record.
+        let newer = BlockRecord::new(
+            101,
+            "0xbeacon".to_string(),
+            100,
+            "0xexechash".to_string(),
+            "0xnew".to_string(),
+            vec!["reth-zisk".to_string()],
+            2_000,
+        );
+        let evicted = store.record(newer).await.expect("record");
+        close_evicted_spans(&spans, &evicted);
+        assert!(spans.lock().expect("registry lock").is_empty());
     }
 
     #[test]

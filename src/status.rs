@@ -278,7 +278,11 @@ pub trait StatusStore: Send + Sync {
     async fn seen(&self, root: &str) -> bool;
 
     /// Records (or replaces) a request record.
-    async fn record(&self, record: BlockRecord) -> Result<()>;
+    ///
+    /// Returns the request roots of any records evicted to honor the history
+    /// cap, so the caller can release what it holds per record (open span
+    /// handles) and refresh state-derived gauges.
+    async fn record(&self, record: BlockRecord) -> Result<Vec<String>>;
 
     /// Resolves one proof of a recorded request to a terminal outcome.
     ///
@@ -295,6 +299,13 @@ pub trait StatusStore: Send + Sync {
 
     /// The highest slot recorded so far, if any.
     async fn latest_slot(&self) -> Option<u64>;
+
+    /// Number of proofs currently unresolved (submitted, outcome unknown).
+    ///
+    /// The inflight gauge is set absolutely from this count rather than
+    /// maintained as event deltas, so it survives restarts and history
+    /// eviction without drifting.
+    async fn inflight_proofs(&self) -> usize;
 
     /// All recorded requests, newest slot first.
     async fn records(&self) -> Vec<BlockRecord>;
@@ -361,6 +372,15 @@ impl State {
         self.records.values().map(|r| r.slot).max()
     }
 
+    /// Number of proofs currently unresolved (submitted, outcome unknown).
+    fn inflight_proofs(&self) -> usize {
+        self.records
+            .values()
+            .flat_map(|record| &record.proofs)
+            .filter(|proof| proof.outcome == Outcome::Sent)
+            .count()
+    }
+
     fn snapshot(&self) -> Vec<BlockRecord> {
         let mut records: Vec<BlockRecord> = self.records.values().cloned().collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.slot));
@@ -368,10 +388,14 @@ impl State {
     }
 
     /// Evicts the lowest-slot records until at most `max_history` remain
-    /// (`max_history` of 0 means unlimited).
-    fn prune(&mut self, max_history: usize) {
+    /// (`max_history` of 0 means unlimited). Returns the request roots of the
+    /// evicted records so callers can release per-record resources — an
+    /// evicted record may still be unresolved, and its inflight-gauge share
+    /// and open span handle must not outlive it.
+    fn prune(&mut self, max_history: usize) -> Vec<String> {
+        let mut evicted = Vec::new();
         if max_history == 0 {
-            return;
+            return evicted;
         }
         while self.records.len() > max_history {
             let oldest = self
@@ -382,10 +406,12 @@ impl State {
             match oldest {
                 Some(key) => {
                     self.records.remove(&key);
+                    evicted.push(key);
                 }
                 None => break,
             }
         }
+        evicted
     }
 }
 
@@ -432,11 +458,12 @@ impl StatusStore for JsonStatusStore {
         self.state.lock().await.seen(root)
     }
 
-    async fn record(&self, record: BlockRecord) -> Result<()> {
+    async fn record(&self, record: BlockRecord) -> Result<Vec<String>> {
         let mut state = self.state.lock().await;
         state.insert(record);
-        state.prune(self.max_history);
-        self.persist(&state).await
+        let evicted = state.prune(self.max_history);
+        self.persist(&state).await?;
+        Ok(evicted)
     }
 
     async fn resolve_proof(
@@ -457,6 +484,10 @@ impl StatusStore for JsonStatusStore {
 
     async fn latest_slot(&self) -> Option<u64> {
         self.state.lock().await.latest_slot()
+    }
+
+    async fn inflight_proofs(&self) -> usize {
+        self.state.lock().await.inflight_proofs()
     }
 
     async fn records(&self) -> Vec<BlockRecord> {
@@ -487,11 +518,10 @@ impl StatusStore for MemoryStatusStore {
         self.state.lock().await.seen(root)
     }
 
-    async fn record(&self, record: BlockRecord) -> Result<()> {
+    async fn record(&self, record: BlockRecord) -> Result<Vec<String>> {
         let mut state = self.state.lock().await;
         state.insert(record);
-        state.prune(self.max_history);
-        Ok(())
+        Ok(state.prune(self.max_history))
     }
 
     async fn resolve_proof(
@@ -510,6 +540,10 @@ impl StatusStore for MemoryStatusStore {
 
     async fn latest_slot(&self) -> Option<u64> {
         self.state.lock().await.latest_slot()
+    }
+
+    async fn inflight_proofs(&self) -> usize {
+        self.state.lock().await.inflight_proofs()
     }
 
     async fn records(&self) -> Vec<BlockRecord> {
@@ -731,6 +765,48 @@ mod tests {
         assert!(store.seen("0xb").await);
         assert!(store.seen("0xc").await);
         assert_eq!(store.latest_slot().await, Some(102));
+    }
+
+    #[tokio::test]
+    async fn record_returns_the_evicted_roots() {
+        let store = MemoryStatusStore::new(1);
+        assert!(
+            store
+                .record(record(100, "0xa"))
+                .await
+                .expect("record")
+                .is_empty()
+        );
+
+        // Inserting a newer record over the cap evicts the older one and
+        // reports it, so the caller can release its span handle.
+        let evicted = store.record(record(101, "0xb")).await.expect("record");
+        assert_eq!(evicted, vec!["0xa".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn inflight_proofs_counts_only_unresolved_proofs() {
+        let store = MemoryStatusStore::new(0);
+        assert_eq!(store.inflight_proofs().await, 0);
+
+        store
+            .record(multi_proof_record(100, "0xa"))
+            .await
+            .expect("record");
+        store.record(record(101, "0xb")).await.expect("record");
+        assert_eq!(store.inflight_proofs().await, 3);
+
+        store
+            .resolve_proof("0xa", "reth-zisk", Outcome::Complete, None)
+            .await
+            .expect("resolve proof");
+        assert_eq!(store.inflight_proofs().await, 2);
+
+        // Eviction drops the evicted record's unresolved proof from the count.
+        let store = MemoryStatusStore::new(1);
+        store.record(record(100, "0xa")).await.expect("record");
+        store.record(record(101, "0xb")).await.expect("record");
+        assert_eq!(store.inflight_proofs().await, 1);
     }
 
     #[test]
