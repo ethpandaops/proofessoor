@@ -54,8 +54,11 @@ Prefer containers? See [Run the full stack](#run-the-full-stack).
 Two endpoints are always required — pass them as flags or environment variables:
 
 - **`--beacon-url`** (`PROOFESSOOR_BEACON_URL`) — your Beacon API's HTTP
-  endpoint. Supplies the blocks to prove. For an authenticated beacon, add
-  `--beacon-header "Name: Value"` (`PROOFESSOOR_BEACON_HEADER`), e.g. an API key.
+  endpoint. It must serve blocks, `/eth/v1/config/spec`, and
+  `/eth/v1/beacon/genesis`; proofessoor fetches the latter two once at startup
+  to resolve the execution fork required by zkBoost. For an authenticated
+  beacon, add `--beacon-header "Name: Value"`
+  (`PROOFESSOOR_BEACON_HEADER`), e.g. an API key.
 - **`--zkboost-url`** (`PROOFESSOOR_ZKBOOST_URL`) — your zkBoost instance's
   address. Coordinates the proving.
 

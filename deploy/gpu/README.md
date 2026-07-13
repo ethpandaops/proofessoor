@@ -42,11 +42,12 @@ it instead of building (set `PROOFESSOOR_IMAGE` to pin a version).
 
 ## Chain config
 
-zkBoost gets the chain config straight from your EL via `debug_chainConfig`, so
-with a proper EL there's nothing to set — whatever chain the EL runs is what gets
-proved. Some public RPCs don't serve that method; if
-yours doesn't, generate the config for your network and point zkBoost at it
-(hoodi shown — swap `hoodi` for your network):
+Each proof request carries the active fork derived by proofessoor from the
+Beacon API. zkBoost separately reads the execution-layer genesis config via
+`debug_chainConfig` to complete and validate the execution-only blob parameters.
+With a proper EL there is nothing to set. Some public RPCs do not serve that
+method; if yours does not, generate the EL genesis config for your network and
+point zkBoost at it (hoodi shown — swap `hoodi` for your network):
 
 ```bash
 curl -s https://raw.githubusercontent.com/eth-clients/hoodi/main/metadata/genesis.json \

@@ -63,8 +63,8 @@ services:
       RUST_LOG: "info,zkboost=debug"
     volumes:
       - ./zkboost.toml:/config/zkboost.toml:ro
-      # If your EL doesn't serve debug_chainConfig (e.g. a public RPC), generate a
-      # chain config (see README) and uncomment to load it:
+      # If your EL doesn't serve debug_chainConfig, generate its genesis config
+      # (see README) and uncomment to let zkBoost load it:
       # - ./hoodi_chain_config.json:/config/hoodi_chain_config.json:ro
     ports:
       - "3000:3000" # zkboost API + /dashboard

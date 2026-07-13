@@ -127,7 +127,7 @@ pub fn block_hash(request: &NewPayloadRequest) -> Hash256 {
 
 /// The length in bytes of the SSZ-encoded payload request inside the body
 /// zkBoost receives.
-pub fn ssz_len(request: &NewPayloadRequest) -> usize {
+pub fn encoded_len(request: &NewPayloadRequest) -> usize {
     request.encoded_len()
 }
 

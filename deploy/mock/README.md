@@ -21,7 +21,8 @@ and Beacon API**. The only thing removed is the prover.
 - An **EL RPC** that serves `debug_executionWitnessByBlockHash` (e.g. a hoodi
   reth supernode) — zkBoost fetches the witness here; a rate-limited public RPC
   causes `WitnessTimeout`.
-- A **Beacon API** — proofessoor reads blocks here.
+- A **Beacon API** that serves blocks, `/eth/v1/config/spec`, and
+  `/eth/v1/beacon/genesis` — proofessoor reads the fork schedule once at startup.
 
 ## Quick start
 
@@ -63,11 +64,12 @@ will time out — keep the timeout comfortably larger.
 
 ## Chain config
 
-zkBoost gets the chain config straight from your EL via `debug_chainConfig`, so
-with a proper EL there's nothing to set — whatever chain the EL runs is what gets
-executed. Some public RPCs don't serve that method; if yours doesn't, generate
-the config for your network and point zkBoost at it (hoodi shown — swap `hoodi`
-for your network):
+Each proof request carries the active fork derived by proofessoor from the
+Beacon API. zkBoost separately reads the execution-layer genesis config via
+`debug_chainConfig` to complete and validate the execution-only blob parameters.
+With a proper EL there is nothing to set. Some public RPCs do not serve that
+method; if yours does not, generate the EL genesis config for your network and
+point zkBoost at it (hoodi shown — swap `hoodi` for your network):
 
 ```bash
 curl -s https://raw.githubusercontent.com/eth-clients/hoodi/main/metadata/genesis.json \

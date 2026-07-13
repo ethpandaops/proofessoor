@@ -5,9 +5,9 @@ port = 3000
 # blocks you prove (e.g. a hoodi reth supernode). zkboost fetches the witness here
 # before handing it to the prover; a rate-limited public RPC causes WitnessTimeout.
 el_endpoint = "http://CHANGE-ME-hoodi-el:8545"
-# zkBoost gets the chain config from the EL via debug_chainConfig. If your EL
-# doesn't serve it (e.g. a public RPC), generate a chain config (see README) and
-# uncomment the next line plus its mount in docker-compose.yml:
+# zkBoost gets the execution-layer genesis config via debug_chainConfig to
+# complete and validate the ChainConfig carried by each request. If your EL
+# doesn't serve it, generate the EL genesis config (see README) and uncomment:
 # chain_config_path = "/config/hoodi_chain_config.json"
 witness_timeout_secs = 12
 

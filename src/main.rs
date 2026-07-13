@@ -136,7 +136,7 @@ async fn run_request(args: RequestArgs) -> Result<()> {
         execution_block_hash = %request::block_hash(&payload_request),
         execution_block_number = payload_request.block_number(),
         new_payload_request_root = %server_root,
-        request_bytes = request::ssz_len(&payload_request),
+        new_payload_request_bytes = request::encoded_len(&payload_request),
         proof_types = %render_proof_types(&args.proof_types),
         "proof requested"
     );
