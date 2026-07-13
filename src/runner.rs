@@ -26,6 +26,7 @@ use tracing::{Instrument, Span, debug, field, info, info_span, warn};
 use zkboost_client::{Hash256, ProofType};
 
 use crate::beacon::{self, BlockEvent};
+use crate::chain_config::ChainConfigSchedule;
 use crate::config::{BlockId, StreamArgs};
 use crate::metrics::{
     BLOCKS_OBSERVED, BLOCKS_SKIPPED, COMPLETION_DURATION, HEAD_LAG, INFLIGHT_REQUESTS,
@@ -174,6 +175,24 @@ pub async fn run(args: StreamArgs) -> Result<()> {
     );
     let semaphore = Arc::new(Semaphore::new(args.max_inflight.get()));
     let latest_requested = Arc::new(AtomicU64::new(0));
+
+    // zkBoost requires each block's active execution fork alongside the
+    // payload. The schedule is fixed by the consensus spec and genesis time,
+    // so it is built once at startup; a spec change (a newly scheduled fork
+    // on a devnet) needs a restart to be picked up.
+    let config = beacon
+        .get_config()
+        .await
+        .context("failed to fetch the beacon spec config")?;
+    let genesis_time = beacon
+        .get_genesis_time()
+        .await
+        .context("failed to fetch the beacon genesis time")?;
+    let schedule = Arc::new(ChainConfigSchedule::new(&config, genesis_time)?);
+    info!(
+        chain_id = schedule.chain_id(),
+        "built the chain-config fork schedule"
+    );
     let artifacts = Arc::new(zkboost::Artifacts {
         download: args.download,
         verify: args.verify,
@@ -202,6 +221,7 @@ pub async fn run(args: StreamArgs) -> Result<()> {
         zkboost.clone(),
         store.clone(),
         artifacts.clone(),
+        schedule.clone(),
         spans.clone(),
         args.reconcile_after,
         reconciler.clone(),
@@ -297,11 +317,13 @@ pub async fn run(args: StreamArgs) -> Result<()> {
             let store = store.clone();
             let latest_requested = latest_requested.clone();
             let spans = spans.clone();
+            let schedule = schedule.clone();
             tasks.spawn(async move {
                 let _permit = permit;
                 if let Err(error) = process_block(
                     &beacon,
                     &zkboost,
+                    &schedule,
                     &proof_types,
                     &store,
                     &latest_requested,
@@ -370,6 +392,7 @@ pub async fn run(args: StreamArgs) -> Result<()> {
 async fn process_block(
     beacon: &beacon::Client,
     zkboost: &zkboost::Client,
+    schedule: &ChainConfigSchedule,
     proof_types: &[ProofType],
     store: &Arc<dyn StatusStore>,
     latest_requested: &AtomicU64,
@@ -380,6 +403,7 @@ async fn process_block(
     let result = submit_block(
         beacon,
         zkboost,
+        schedule,
         proof_types,
         store,
         latest_requested,
@@ -399,6 +423,7 @@ async fn process_block(
 async fn submit_block(
     beacon: &beacon::Client,
     zkboost: &zkboost::Client,
+    schedule: &ChainConfigSchedule,
     proof_types: &[ProofType],
     store: &Arc<dyn StatusStore>,
     latest_requested: &AtomicU64,
@@ -438,9 +463,15 @@ async fn submit_block(
         return Ok(());
     }
 
+    // Errors bubble like fetch/build failures: a block whose timestamp
+    // precedes every scheduled fork has no payload to prove anyway.
+    let chain_config = schedule
+        .resolve(payload_request.timestamp())
+        .context("no execution fork is active at the block's timestamp")?;
+
     let submit_start = Instant::now();
     let server_root = match zkboost
-        .request_proof(&payload_request, proof_types)
+        .request_proof(&payload_request, &chain_config, proof_types)
         .instrument(info_span!("submit_request"))
         .await
     {
@@ -453,7 +484,7 @@ async fn submit_block(
             let mut record = failed_record(
                 &fetched,
                 payload_request.block_number(),
-                payload_request.block_hash().to_string(),
+                request::block_hash(&payload_request).to_string(),
                 root_hex.clone(),
                 proof_types,
                 observed_at_ms,
@@ -478,7 +509,7 @@ async fn submit_block(
         let mut record = failed_record(
             &fetched,
             payload_request.block_number(),
-            payload_request.block_hash().to_string(),
+            request::block_hash(&payload_request).to_string(),
             root_hex.clone(),
             proof_types,
             observed_at_ms,
@@ -507,7 +538,7 @@ async fn submit_block(
         fetched.slot(),
         fetched.root().to_string(),
         payload_request.block_number(),
-        payload_request.block_hash().to_string(),
+        request::block_hash(&payload_request).to_string(),
         root_hex.clone(),
         proof_types.iter().map(|p| p.as_str().to_string()).collect(),
         observed_at_ms,
@@ -685,6 +716,7 @@ async fn watch(
     zkboost: Arc<zkboost::Client>,
     store: Arc<dyn StatusStore>,
     artifacts: Arc<zkboost::Artifacts>,
+    schedule: Arc<ChainConfigSchedule>,
     spans: SpanRegistry,
     reconcile_after: Duration,
     reconciler: ReconcilerSlot,
@@ -717,7 +749,7 @@ async fn watch(
                 }
             };
             if let Err(error) =
-                handle_proof_event(&zkboost, &store, &artifacts, &spans, event).await
+                handle_proof_event(&zkboost, &store, &artifacts, &schedule, &spans, event).await
             {
                 warn!(%error, "failed to handle proof event");
             }
@@ -795,23 +827,28 @@ async fn handle_proof_event(
     zkboost: &zkboost::Client,
     store: &Arc<dyn StatusStore>,
     artifacts: &zkboost::Artifacts,
+    schedule: &ChainConfigSchedule,
     spans: &SpanRegistry,
     event: ProofEvent,
 ) -> Result<()> {
     match event {
         ProofEvent::ProofComplete(complete) => {
             let root_hex = complete.new_payload_request_root.to_string();
-            let Some(_resolution) =
+            let Some(resolution) =
                 record_completion(store, spans, &root_hex, complete.proof_type.as_str()).await?
             else {
                 return Ok(());
             };
             info!(root = %root_hex, proof_type = %complete.proof_type, "proof complete");
             if artifacts.needs_proof_bytes() {
+                // Verification must carry the chain config of the proof's own
+                // block, resolved from its recorded slot.
+                let chain_config = schedule.resolve_slot(resolution.slot);
                 zkboost
                     .collect_artifacts(
                         complete.new_payload_request_root,
                         complete.proof_type,
+                        chain_config.as_ref(),
                         artifacts,
                     )
                     .await?;
@@ -1817,6 +1854,7 @@ mod tests {
             "0xroot",
             &ProofResolution {
                 duration_ms: 10,
+                slot: 1,
                 block_outcome: Outcome::Sent,
                 block_resolved: false,
             },
@@ -1829,6 +1867,7 @@ mod tests {
             "0xroot",
             &ProofResolution {
                 duration_ms: 10,
+                slot: 1,
                 block_outcome: Outcome::Complete,
                 block_resolved: true,
             },

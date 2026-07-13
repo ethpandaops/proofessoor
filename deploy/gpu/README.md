@@ -62,7 +62,7 @@ then uncomment `chain_config_path` in `zkboost.toml` and its mount in
   its setup before serving proofs — several minutes. The `service_healthy` gate
   holds zkBoost/proofessoor back until it's listening, and the `ere-zisk-setup`
   volume persists the result so later restarts skip it.
-- Image versions track zkboost `v0.8.0` (ere/ere-guests `v0.12.1`). If you bump
+- Image versions track zkboost `v0.9.0` (ere/ere-guests `v0.13.0`). If you bump
   zkboost, re-check the pinned ere version in zkboost's `Cargo.toml`.
 - `proofessoor` builds from source via `docker-compose.local.yml`; drop that `-f`
   to run the published image instead.

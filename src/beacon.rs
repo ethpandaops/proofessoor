@@ -10,7 +10,9 @@ use ::metrics::histogram;
 use anyhow::{Context, Result, anyhow, bail};
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use lighthouse_types::{ForkName, ForkVersionDecode, Hash256, MainnetEthSpec, SignedBeaconBlock};
+use lighthouse_types::{
+    Config, ForkName, ForkVersionDecode, Hash256, MainnetEthSpec, SignedBeaconBlock,
+};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::Deserialize;
@@ -90,6 +92,14 @@ where
 {
     let raw = String::deserialize(deserializer)?;
     raw.parse().map_err(serde::de::Error::custom)
+}
+
+/// Response body of `GET /eth/v1/beacon/genesis`.
+#[derive(Debug, Clone, Deserialize)]
+struct GenesisData {
+    /// Unix timestamp of the chain's genesis.
+    #[serde(deserialize_with = "deserialize_quoted_u64")]
+    genesis_time: u64,
 }
 
 /// HTTP client for the Beacon API.
@@ -192,6 +202,50 @@ impl Client {
             fork: fork_name,
             block,
         })
+    }
+
+    /// Fetches the node's spec configuration (`GET /eth/v1/config/spec`) as
+    /// lighthouse's standard [`Config`], so the parsing quirks (quoted
+    /// numbers, optional fork epochs, blob schedules) stay maintained
+    /// upstream. The endpoint serves config+preset merged; [`Config`] decodes
+    /// the config half and ignores the preset keys.
+    pub async fn get_config(&self) -> Result<Config> {
+        self.get_json("/eth/v1/config/spec").await
+    }
+
+    /// Fetches the chain's genesis time (`GET /eth/v1/beacon/genesis`).
+    pub async fn get_genesis_time(&self) -> Result<u64> {
+        let genesis: GenesisData = self.get_json("/eth/v1/beacon/genesis").await?;
+        Ok(genesis.genesis_time)
+    }
+
+    /// Fetches a JSON endpoint and unwraps the Beacon API `data` envelope.
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        #[derive(Deserialize)]
+        struct Envelope<T> {
+            data: T,
+        }
+
+        let url = self
+            .endpoint
+            .join(path)
+            .with_context(|| format!("failed to construct the {path} URL"))?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("failed to reach the Beacon API")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!("Beacon API returned {status} for {path}: {body}");
+        }
+        let body: Envelope<T> = response
+            .json()
+            .await
+            .with_context(|| format!("failed to decode the {path} response"))?;
+        Ok(body.data)
     }
 
     /// Subscribes to the Beacon API `block` event stream

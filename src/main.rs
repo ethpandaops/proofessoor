@@ -4,6 +4,7 @@
 //! to the requested subcommand.
 
 mod beacon;
+mod chain_config;
 mod config;
 mod metrics;
 #[cfg(feature = "otel")]
@@ -102,8 +103,22 @@ async fn run_request(args: RequestArgs) -> Result<()> {
     let payload_request = request::build(block.block())?;
     let local_root = request::root(&payload_request);
 
+    // zkBoost requires the block's active execution fork alongside the payload.
+    let config = beacon
+        .get_config()
+        .await
+        .context("failed to fetch the beacon spec config")?;
+    let genesis_time = beacon
+        .get_genesis_time()
+        .await
+        .context("failed to fetch the beacon genesis time")?;
+    let schedule = chain_config::ChainConfigSchedule::new(&config, genesis_time)?;
+    let chain_config = schedule
+        .resolve(payload_request.timestamp())
+        .context("no execution fork is active at the block's timestamp")?;
+
     let server_root = zkboost
-        .request_proof(&payload_request, &proof_types)
+        .request_proof(&payload_request, &chain_config, &proof_types)
         .await?;
 
     // The server recomputes the root from the submitted SSZ body; a mismatch means
@@ -118,7 +133,7 @@ async fn run_request(args: RequestArgs) -> Result<()> {
         slot = block.slot(),
         beacon_block_root = %block.root(),
         fork = %block.fork(),
-        execution_block_hash = %payload_request.block_hash(),
+        execution_block_hash = %request::block_hash(&payload_request),
         execution_block_number = payload_request.block_number(),
         new_payload_request_root = %server_root,
         request_bytes = request::ssz_len(&payload_request),
@@ -128,7 +143,7 @@ async fn run_request(args: RequestArgs) -> Result<()> {
 
     if args.wait {
         zkboost
-            .wait_for_proofs(server_root, &proof_types, &artifacts)
+            .wait_for_proofs(server_root, &proof_types, Some(&chain_config), &artifacts)
             .await?;
     }
     Ok(())

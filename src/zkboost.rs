@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use url::Url;
-use zkboost_client::{Hash256, MainnetEthSpec, NewPayloadRequest, ProofType, zkBoostClient};
+use zkboost_client::{ChainConfig, Hash256, NewPayloadRequest, ProofType, zkBoostClient};
 
 pub use zkboost_client::ProofEvent;
 
@@ -95,7 +95,7 @@ impl Client {
     /// Creates a client targeting the given zkBoost base URL.
     ///
     /// W3C trace context (`traceparent`) is not injected on outbound calls
-    /// yet: zkboost-client v0.8.0 sends requests through a plain
+    /// yet: zkboost-client v0.9.0 sends requests through a plain
     /// [`reqwest::Client`], whose only header hook (`default_headers`) is
     /// fixed at construction, while `traceparent` must carry each request's
     /// live span context. Injection needs a zkboost-client change — a
@@ -116,15 +116,18 @@ impl Client {
     }
 
     /// Submits a proof request and returns the `new_payload_request_root`
-    /// computed by the server (`POST /v1/execution_proof_requests`).
+    /// computed by the server (`POST /v1/execution_proof_requests`). The
+    /// chain config names the block's active execution fork; zkBoost rejects
+    /// requests whose config does not match the payload.
     pub async fn request_proof(
         &self,
-        request: &NewPayloadRequest<MainnetEthSpec>,
+        request: &NewPayloadRequest,
+        chain_config: &ChainConfig,
         proof_types: &[ProofType],
     ) -> Result<Hash256> {
         let response = self
             .inner
-            .request_proof(request, proof_types)
+            .request_proof(request, chain_config, proof_types)
             .await
             .context("zkBoost rejected the proof request")?;
         Ok(response.new_payload_request_root)
@@ -155,12 +158,14 @@ impl Client {
     ///
     /// Subscribes to the proof event stream filtered to `root`. For completed
     /// proofs it optionally downloads, verifies, and writes the bytes per
-    /// `artifacts`. Returns an error if any requested proof fails or the stream
-    /// ends before all are resolved.
+    /// `artifacts`; verification requires the block's chain config. Returns an
+    /// error if any requested proof fails or the stream ends before all are
+    /// resolved.
     pub async fn wait_for_proofs(
         &self,
         root: Hash256,
         proof_types: &[ProofType],
+        chain_config: Option<&ChainConfig>,
         artifacts: &Artifacts,
     ) -> Result<()> {
         let mut events = Box::pin(self.inner.subscribe_proof_events(Some(root)));
@@ -182,7 +187,7 @@ impl Client {
                 ProofEvent::ProofComplete(complete) => {
                     tracing::info!(%root, proof_type = %complete.proof_type, "proof complete");
                     if artifacts.needs_proof_bytes() {
-                        self.collect_artifacts(root, complete.proof_type, artifacts)
+                        self.collect_artifacts(root, complete.proof_type, chain_config, artifacts)
                             .await?;
                     }
                 }
@@ -207,11 +212,14 @@ impl Client {
         }
     }
 
-    /// Fetches a completed proof once, then verifies and/or saves it per `artifacts`.
+    /// Fetches a completed proof once, then verifies and/or saves it per
+    /// `artifacts`. Verification sends the block's chain config alongside the
+    /// proof, so `--verify` requires it to have resolved.
     pub async fn collect_artifacts(
         &self,
         root: Hash256,
         proof_type: ProofType,
+        chain_config: Option<&ChainConfig>,
         artifacts: &Artifacts,
     ) -> Result<()> {
         let proof = self
@@ -221,9 +229,11 @@ impl Client {
             .context("failed to download proof bytes")?;
 
         if artifacts.verify {
+            let chain_config = chain_config
+                .context("cannot verify: no chain config resolved for the proof's block")?;
             let response = self
                 .inner
-                .verify_proof(root, proof_type, &proof)
+                .verify_proof(root, chain_config, proof_type, &proof)
                 .await
                 .context("failed to verify proof")?;
             if !response.status.is_valid() {
