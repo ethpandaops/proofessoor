@@ -47,8 +47,9 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// How many stuck records reconciliation probes concurrently.
 const RECONCILE_CONCURRENCY: usize = 4;
 
-/// How long a reconciliation probe waits for zkBoost to replay a completion.
-/// Replays arrive immediately on connect, so a short window suffices.
+/// How long a reconciliation probe waits for zkBoost to replay a terminal
+/// outcome. A failure stays buffered for this window so a concurrent retry's
+/// completion can supersede a stale replay before either reaches the store.
 const RECONCILE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound on the cheap liveness request that gates silence verdicts.
@@ -1009,12 +1010,10 @@ fn note_late_event(
 
 /// One reconciliation sweep over proofs still marked sent.
 ///
-/// Outcomes arrive only on zkBoost's live event stream — events that fired
-/// while disconnected are gone. zkBoost does, however, replay its cached
-/// completions when a subscription is opened for a specific root (an LRU of
-/// the most recent completions; failures are never replayed), so each stuck
-/// record is probed with a short-lived per-root subscription, and what stays
-/// silent is judged by age. Every silence verdict is gated on positive
+/// Outcomes arrive on zkBoost's live event stream. A filtered subscription
+/// also replays cached terminal outcomes, so each stuck record is probed with
+/// a short-lived per-root subscription and what stays silent is judged by age.
+/// Every silence verdict is gated on positive
 /// liveness evidence bracketing the probe window: an unreachable or hanging
 /// zkBoost defers all verdicts to a later sweep, because an outage must never
 /// write off a proof whose completion sits unreachable in that cache.
@@ -1185,7 +1184,7 @@ async fn resolve_unprobeable_record(
     }
 }
 
-/// Probes one record's per-root subscription for replayed completions.
+/// Probes one record's per-root subscription for replayed terminal outcomes.
 ///
 /// Returns whether the record may face the silence policy: `true` when the
 /// probe stayed healthy — everything zkBoost had cached for this root was
@@ -1206,91 +1205,134 @@ async fn probe_record(
         .map(|proof| proof.proof_type.clone())
         .collect();
 
-    // The subscription replays cached completions immediately on connect; if
-    // nothing arrives within the window, nothing is cached for this root.
-    let probe = apply_probe_events(
+    // Replays arrive immediately on connect. The processor owns the deadline
+    // so an elapsed window can finalize a buffered failure instead of
+    // cancellation dropping it.
+    apply_probe_events(
         store,
         spans,
         root_hex,
         pending,
+        RECONCILE_PROBE_TIMEOUT,
         zkboost.subscribe_root_events(root),
-    );
-    // An elapsed window (the `Err` case, mapped to `true`) alone cannot
-    // distinguish a quiet healthy subscription from one that never connected
-    // (the client consumes the SSE open event internally); it counts as
-    // observed silence only because the caller brackets the window with
-    // liveness checks.
-    tokio::time::timeout(RECONCILE_PROBE_TIMEOUT, probe)
-        .await
-        .unwrap_or(true)
+    )
+    .await
 }
 
-/// Applies completions from a per-root probe stream until every pending proof
-/// type resolves or the stream ends (the caller bounds it with a timeout).
+/// Applies terminal outcomes from a per-root probe stream until every pending
+/// proof type resolves or the probe deadline elapses.
 ///
 /// Returns whether the record may face the silence policy afterward: `false`
 /// means the stream erred (zkBoost was not observed) or a store write failed
-/// (the completion exists but was not applied — judging that proof silent
+/// (an outcome exists but was not applied — judging that proof silent
 /// would write off work known to have finished).
 ///
-/// Only completions are handled: zkBoost never replays failures, and any live
-/// failure racing in here also reaches the main watcher stream, whose
-/// resolution path is idempotent with this one.
+/// Replayed failures are buffered rather than written immediately. zkBoost's
+/// replay is latest-wins but can race a retry that has already completed: a
+/// stale failure may be emitted just before the new completion. Holding the
+/// failure for the bounded probe window lets that completion win without
+/// weakening the store's global first-terminal-wins invariant.
 async fn apply_probe_events(
     store: &Arc<dyn StatusStore>,
     spans: &SpanRegistry,
     root_hex: &str,
     mut pending: HashSet<String>,
+    probe_timeout: Duration,
     events: impl Stream<Item = Result<ProofEvent>> + Send,
 ) -> bool {
     let mut events = pin!(events);
+    let deadline = tokio::time::Instant::now() + probe_timeout;
+    let mut buffered_failures = HashMap::new();
     while !pending.is_empty() {
-        let event = match events.next().await {
-            Some(Ok(event)) => event,
-            Some(Err(error)) => {
+        let event = match tokio::time::timeout_at(deadline, events.next()).await {
+            Ok(Some(Ok(event))) => event,
+            Ok(Some(Err(error))) => {
                 warn!(root = %root_hex, %error, "reconciliation probe stream error");
                 return false;
             }
-            // Exhaustion without an error: the live subscription surfaces a
-            // dropped connection as an `Err` item first, so getting here
-            // means everything sent (any replays included) was seen.
-            None => return true,
+            // Exhaustion without an error and an elapsed healthy window both
+            // finalize any replayed failures collected so far. Liveness
+            // checks around the whole probe distinguish healthy silence from
+            // a connection that never became usable.
+            Ok(None) | Err(_) => break,
         };
-        let ProofEvent::ProofComplete(complete) = event else {
-            continue;
-        };
-        if complete.new_payload_request_root.to_string() != root_hex {
+        match event {
+            ProofEvent::ProofComplete(complete) => {
+                if complete.new_payload_request_root.to_string() != root_hex {
+                    continue;
+                }
+                let proof_type = complete.proof_type.as_str();
+                if !pending.contains(proof_type) {
+                    continue;
+                }
+                buffered_failures.remove(proof_type);
+                // A replayed completion counts as handled — and leaves
+                // `pending` — only once its store write is confirmed (or the
+                // live stream demonstrably beat this one to it).
+                match record_completion(store, spans, root_hex, proof_type).await {
+                    Ok(Some(_)) => {
+                        pending.remove(proof_type);
+                        counter!(RECONCILE_ACTIONS, "verdict" => "complete").increment(1);
+                        info!(
+                            root = %root_hex,
+                            proof_type,
+                            verdict = "complete",
+                            "reconciled proof from replayed completion"
+                        );
+                    }
+                    // The live stream already resolved it — the race is a no-op here.
+                    Ok(None) => {
+                        pending.remove(proof_type);
+                    }
+                    Err(error) => {
+                        warn!(root = %root_hex, proof_type, %error, "failed to record a replayed completion");
+                        return false;
+                    }
+                }
+            }
+            ProofEvent::ProofFailure(failure) => {
+                if failure.new_payload_request_root.to_string() != root_hex {
+                    continue;
+                }
+                let proof_type = failure.proof_type.as_str();
+                if pending.contains(proof_type) {
+                    buffered_failures.insert(proof_type.to_owned(), failure);
+                }
+            }
+        }
+    }
+
+    for (proof_type, failure) in buffered_failures {
+        if !pending.contains(&proof_type) {
             continue;
         }
-        let proof_type = complete.proof_type.as_str();
-        if !pending.contains(proof_type) {
-            continue;
-        }
-        // A replayed completion counts as handled — and leaves `pending` —
-        // only once its store write is confirmed (or the live stream
-        // demonstrably beat this one to it).
-        match record_completion(store, spans, root_hex, proof_type).await {
+        let detail = status::Failure {
+            stage: FailureStage::Proving,
+            reason: format!("{:?}", failure.reason),
+            error: failure.error,
+        };
+        match record_failure(store, spans, root_hex, &proof_type, detail).await {
             Ok(Some(_)) => {
-                pending.remove(proof_type);
-                counter!(RECONCILE_ACTIONS, "verdict" => "complete").increment(1);
-                info!(
+                pending.remove(&proof_type);
+                counter!(RECONCILE_ACTIONS, "verdict" => "failed").increment(1);
+                warn!(
                     root = %root_hex,
                     proof_type,
-                    verdict = "complete",
-                    "reconciled proof from replayed completion"
+                    verdict = "failed",
+                    "reconciled proof from replayed failure"
                 );
             }
-            // The live stream already resolved it — the race is a no-op here.
+            // The live stream resolved it while this probe was open.
             Ok(None) => {
-                pending.remove(proof_type);
+                pending.remove(&proof_type);
             }
             Err(error) => {
-                warn!(root = %root_hex, proof_type, %error, "failed to record a replayed completion");
+                warn!(root = %root_hex, proof_type, %error, "failed to record a replayed failure");
                 return false;
             }
         }
     }
-    // Every pending proof resolved from the replay.
+
     true
 }
 
@@ -1363,7 +1405,7 @@ async fn resolve_silent_proofs(
 
 #[cfg(test)]
 mod tests {
-    use zkboost_client::ProofComplete;
+    use zkboost_client::{FailureReason, ProofComplete, ProofFailure};
 
     use super::*;
 
@@ -1401,6 +1443,15 @@ mod tests {
             .into_iter()
             .next()
             .expect("one record")
+    }
+
+    fn proof_failure(root: Hash256, error: &str) -> ProofEvent {
+        ProofEvent::ProofFailure(ProofFailure {
+            new_payload_request_root: root,
+            proof_type: zkboost::parse_proof_type("reth-zisk").expect("valid proof type"),
+            reason: FailureReason::ProvingError,
+            error: error.to_owned(),
+        })
     }
 
     #[tokio::test]
@@ -1567,6 +1618,7 @@ mod tests {
             &span_registry(),
             &record.new_payload_request_root,
             pending,
+            Duration::from_secs(1),
             replay,
         )
         .await;
@@ -1591,12 +1643,79 @@ mod tests {
             &span_registry(),
             &record.new_payload_request_root,
             pending,
+            Duration::from_secs(1),
             replay,
         )
         .await;
 
         assert!(observed);
         assert_eq!(stored_record(&store).await.outcome(), Outcome::Complete);
+    }
+
+    #[tokio::test]
+    async fn replayed_failure_resolves_failed_when_no_completion_follows() {
+        let store = memory_store();
+        let record = sent_record(1_000);
+        store.record(record.clone()).await.expect("record");
+
+        let root: Hash256 = record.new_payload_request_root.parse().expect("valid root");
+        // A real SSE subscription stays open after replaying the cached
+        // failure. Keep this stream pending so the probe deadline, rather
+        // than stream exhaustion, is what finalizes the buffered failure.
+        let replay = futures::stream::iter(vec![Ok(proof_failure(root, "proving exploded"))])
+            .chain(futures::stream::pending::<Result<ProofEvent>>());
+        let pending: HashSet<String> = ["reth-zisk".to_string()].into();
+        let observed = apply_probe_events(
+            &store,
+            &span_registry(),
+            &record.new_payload_request_root,
+            pending,
+            Duration::from_millis(10),
+            replay,
+        )
+        .await;
+
+        assert!(observed);
+        let stored = stored_record(&store).await;
+        assert_eq!(stored.outcome(), Outcome::Failed);
+        let proof = stored.proofs.first().expect("one proof");
+        assert_eq!(proof.stage, Some(FailureStage::Proving));
+        assert_eq!(proof.reason.as_deref(), Some("ProvingError"));
+        assert_eq!(proof.error.as_deref(), Some("proving exploded"));
+    }
+
+    #[tokio::test]
+    async fn completion_supersedes_a_stale_replayed_failure() {
+        let store = memory_store();
+        let record = sent_record(1_000);
+        store.record(record.clone()).await.expect("record");
+
+        let root: Hash256 = record.new_payload_request_root.parse().expect("valid root");
+        let proof_type = zkboost::parse_proof_type("reth-zisk").expect("valid proof type");
+        let replay = futures::stream::iter(vec![
+            Ok(proof_failure(root, "stale retry failure")),
+            Ok(ProofEvent::ProofComplete(ProofComplete {
+                new_payload_request_root: root,
+                proof_type,
+            })),
+        ]);
+        let pending: HashSet<String> = ["reth-zisk".to_string()].into();
+        let observed = apply_probe_events(
+            &store,
+            &span_registry(),
+            &record.new_payload_request_root,
+            pending,
+            Duration::from_secs(1),
+            replay,
+        )
+        .await;
+
+        assert!(observed);
+        let stored = stored_record(&store).await;
+        assert_eq!(stored.outcome(), Outcome::Complete);
+        let proof = stored.proofs.first().expect("one proof");
+        assert_eq!(proof.reason, None);
+        assert_eq!(proof.error, None);
     }
 
     #[tokio::test]
@@ -1614,6 +1733,7 @@ mod tests {
             &span_registry(),
             &record.new_payload_request_root,
             pending,
+            Duration::from_secs(1),
             replay,
         )
         .await;
@@ -1659,6 +1779,7 @@ mod tests {
             &span_registry(),
             &record.new_payload_request_root,
             pending,
+            Duration::from_secs(1),
             replay,
         )
         .await;
