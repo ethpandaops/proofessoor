@@ -127,12 +127,10 @@ non-optimistic block. Useful flags:
   outcome arriving after a proof was already judged is discarded (records
   resolve once) but is counted in
   `proofessoor_late_events_discarded_total{kind}` and logged, so a wrong
-  verdict is observable. Missed *completions* are recovered from zkBoost's
-  replay cache,
-  but that cache holds only the most recent completions (LRU, 128 entries),
-  so an outage spanning more than ~128 completions can still lose outcomes —
-  an upstream zkBoost change to also replay failures is in flight and will be
-  the root fix for missed events.
+  verdict is observable. Missed terminal outcomes are recovered from zkBoost's
+  replay caches, but those caches hold only the most recent completions and
+  failures (LRU, 128 entries per configured zkVM by default), so an outage
+  spanning more than that replay horizon can still lose outcomes.
 
 > **Stream proves one proof type at a time.** The status model tracks each
 > proof type separately, but multi-proof streaming is unexercised end to end

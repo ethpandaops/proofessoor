@@ -138,9 +138,9 @@ impl Client {
 
     /// Subscribes to the proof events of a single request root.
     ///
-    /// On connect zkBoost replays the completions it still holds cached for
-    /// that root before any live events; failures are never replayed. That
-    /// replay is what reconciliation probes for after a stream drop.
+    /// On connect zkBoost replays the terminal outcomes it still holds cached
+    /// for that root before any live events. That replay is what reconciliation
+    /// probes for after a stream drop.
     pub fn subscribe_root_events(
         &self,
         root: Hash256,
