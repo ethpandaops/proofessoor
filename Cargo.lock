@@ -4732,17 +4732,20 @@ dependencies = [
 [[package]]
 name = "zkboost-client"
 version = "0.9.0"
-source = "git+https://github.com/eth-act/zkboost?tag=v0.9.0#b5810fea25c917386cf502bc4be1b2dff7db725a"
+source = "git+https://github.com/chetanyb/zkboost?rev=121b537d8882036cf1b7bd56e8c521891b089841#121b537d8882036cf1b7bd56e8c521891b089841"
 dependencies = [
  "async-stream",
  "bytes",
  "futures",
+ "opentelemetry",
  "reqwest",
  "reqwest-eventsource",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio-stream",
+ "tracing",
+ "tracing-opentelemetry",
  "url",
  "zkboost-types",
 ]
@@ -4750,7 +4753,7 @@ dependencies = [
 [[package]]
 name = "zkboost-types"
 version = "0.9.0"
-source = "git+https://github.com/eth-act/zkboost?tag=v0.9.0#b5810fea25c917386cf502bc4be1b2dff7db725a"
+source = "git+https://github.com/chetanyb/zkboost?rev=121b537d8882036cf1b7bd56e8c521891b089841#121b537d8882036cf1b7bd56e8c521891b089841"
 dependencies = [
  "alloy-primitives",
  "ere-catalog",

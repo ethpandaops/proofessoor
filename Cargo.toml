@@ -16,6 +16,7 @@ otel = [
   "dep:opentelemetry-otlp",
   "dep:opentelemetry_sdk",
   "dep:tracing-opentelemetry",
+  "zkboost-client/otel",
 ]
 
 [dependencies]
@@ -47,8 +48,12 @@ tracing = "0.1"
 tracing-opentelemetry = { version = "0.32", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
-zkboost-client = { git = "https://github.com/eth-act/zkboost", tag = "v0.9.0" }
-zkboost-types = { git = "https://github.com/eth-act/zkboost", tag = "v0.9.0" }
+# Keep both crates on the same source: zkboost-client re-exports these protocol
+# types, and Cargo treats identical types from different Git sources as distinct.
+# This revision is v0.9.0 plus the trace-propagation and terminal-event replay
+# extensions proofessoor integrates with; the exact rev keeps builds reproducible.
+zkboost-client = { git = "https://github.com/chetanyb/zkboost", rev = "121b537d8882036cf1b7bd56e8c521891b089841" }
+zkboost-types = { git = "https://github.com/chetanyb/zkboost", rev = "121b537d8882036cf1b7bd56e8c521891b089841" }
 
 [dev-dependencies]
 # In-memory span exporter for the otel-gated span tests; compiled for tests

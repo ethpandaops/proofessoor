@@ -153,7 +153,9 @@ with the block's outcome; the trace id is stored on the block's status record. T
 exporter reads the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable — when
 unset, tracing stays off and behavior is identical to a build without the
 feature. `OTEL_SERVICE_NAME` overrides the default service name
-`proofessoor`.
+`proofessoor`. Outbound zkBoost calls carry the active W3C trace context; a
+zkBoost build with inbound context extraction joins those calls to the same
+distributed trace.
 
 ### `status` — read what was recorded
 
