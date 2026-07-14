@@ -88,7 +88,8 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         latest_slot: records.first().map(|record| record.slot),
     };
     for record in &records {
-        match record.outcome {
+        // Tiles count blocks by their derived (worst-of) outcome, not proofs.
+        match record.outcome() {
             Outcome::Sent => summary.sent += 1,
             Outcome::Complete => summary.complete += 1,
             Outcome::Failed => summary.failed += 1,

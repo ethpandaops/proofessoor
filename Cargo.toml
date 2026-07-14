@@ -6,6 +6,18 @@ rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 description = "Clientless execution-proof requestor for zkBoost"
 
+[features]
+# Optional OpenTelemetry tracing: exports spans over OTLP/gRPC when
+# OTEL_EXPORTER_OTLP_ENDPOINT is set (unset, behavior is identical to a build
+# without the feature). Crate majors track zkBoost so both services can share
+# a collector setup.
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry-otlp",
+  "dep:opentelemetry_sdk",
+  "dep:tracing-opentelemetry",
+]
+
 [dependencies]
 anyhow = "1.0"
 async-stream = "0.3"
@@ -25,6 +37,9 @@ futures = "0.3"
 lighthouse_types = { git = "https://github.com/sigp/lighthouse", branch = "unstable", package = "types" }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"], optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
 reqwest = { version = "0.12", features = ["json"] }
 reqwest-eventsource = "0.6"
 serde = { version = "1.0", features = ["derive"] }
@@ -34,10 +49,16 @@ ssz_types = "0.14"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
+tracing-opentelemetry = { version = "0.32", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 zkboost-client = { git = "https://github.com/eth-act/zkboost", tag = "v0.8.0" }
 zkboost-types = { git = "https://github.com/eth-act/zkboost", tag = "v0.8.0" }
+
+[dev-dependencies]
+# In-memory span exporter for the otel-gated span tests; compiled for tests
+# only.
+opentelemetry_sdk = { version = "0.31", features = ["testing"] }
 
 [lints.clippy]
 unwrap_used = "deny"

@@ -16,8 +16,15 @@ use zkboost_client::{Hash256, MainnetEthSpec, NewPayloadRequest, ProofType, zkBo
 
 pub use zkboost_client::ProofEvent;
 
-/// Default timeout applied to zkBoost HTTP requests.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on establishing a TCP connection to zkBoost.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on each socket read. This is the hang detector for both unary calls
+/// and the long-lived SSE event stream: zkBoost sends an SSE keep-alive every
+/// 15s, so a 60s read gap means the connection is dead, not quiet. A *total*
+/// request timeout would instead kill the healthy event stream on schedule
+/// (it did, every 30s), forcing constant reconnect/reconcile churn.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Parses a proof type name (e.g. `reth-zisk`) into a zkBoost [`ProofType`].
 pub fn parse_proof_type(name: &str) -> Result<ProofType> {
@@ -86,9 +93,18 @@ pub struct Client {
 
 impl Client {
     /// Creates a client targeting the given zkBoost base URL.
+    ///
+    /// W3C trace context (`traceparent`) is not injected on outbound calls
+    /// yet: zkboost-client v0.8.0 sends requests through a plain
+    /// [`reqwest::Client`], whose only header hook (`default_headers`) is
+    /// fixed at construction, while `traceparent` must carry each request's
+    /// live span context. Injection needs a zkboost-client change — a
+    /// per-request header/middleware hook, or per-call header parameters —
+    /// and this constructor is the seam to wire it through once available.
     pub fn new(endpoint: Url) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .context("failed to build zkBoost HTTP client")?;
         let inner = zkBoostClient::with_http_client(endpoint.clone(), http.clone());
@@ -118,6 +134,20 @@ impl Client {
     pub fn subscribe_proof_events(&self) -> impl Stream<Item = Result<ProofEvent>> + Send + '_ {
         self.inner
             .subscribe_proof_events(None)
+            .map(|event| event.context("zkBoost proof event stream error"))
+    }
+
+    /// Subscribes to the proof events of a single request root.
+    ///
+    /// On connect zkBoost replays the completions it still holds cached for
+    /// that root before any live events; failures are never replayed. That
+    /// replay is what reconciliation probes for after a stream drop.
+    pub fn subscribe_root_events(
+        &self,
+        root: Hash256,
+    ) -> impl Stream<Item = Result<ProofEvent>> + Send + '_ {
+        self.inner
+            .subscribe_proof_events(Some(root))
             .map(|event| event.context("zkBoost proof event stream error"))
     }
 

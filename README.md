@@ -112,15 +112,45 @@ non-optimistic block. Useful flags:
 - `--http-addr HOST:PORT` — serve the dashboard, metrics, and health (below).
 - `--ui-dir DIR` — directory of built dashboard assets to serve.
 - `--download` / `--verify` / `--out-dir` — save and/or verify completed proofs.
+- `--reconcile-after DURATION` — how long a submitted proof may stay silent
+  before reconciliation marks it failed as `Unresolved` (default `900s`;
+  accepts `s`/`m`/`h` suffixes). Budget zkBoost's whole pipeline:
+  `witness_timeout` + worst-case queue wait + `proof_timeout` — the queue wait
+  is unbounded under proving backlog (`proof_timeout` bounds only the prove
+  call), so leave generous headroom. Reconciliation runs when the proof-event
+  stream (re)connects and periodically while connected, probing only records
+  older than a quarter of this cutoff; silence only counts while zkBoost is
+  observably reachable, and all verdicts are deferred while it is not. A real
+  outcome arriving after a proof was already judged is discarded (records
+  resolve once) but is counted in
+  `proofessoor_late_events_discarded_total{kind}` and logged, so a wrong
+  verdict is observable. Missed *completions* are recovered from zkBoost's
+  replay cache,
+  but that cache holds only the most recent completions (LRU, 128 entries),
+  so an outage spanning more than ~128 completions can still lose outcomes —
+  an upstream zkBoost change to also replay failures is in flight and will be
+  the root fix for missed events.
 
-> **Stream proves one proof type at a time.** It records one outcome per block,
-> which can't represent different results for several proof types on the same
-> block, so it accepts exactly one `--proof-types` value. Use `request` for
-> multiple.
+> **Stream proves one proof type at a time.** The status model tracks each
+> proof type separately, but multi-proof streaming is unexercised end to end
+> (dashboard aggregation, per-type failure display) and proving several types
+> per block multiplies prover cost, so stream accepts exactly one
+> `--proof-types` value for now. Use `request` for multiple.
 
 `--http-addr` takes a host and port of your choosing and serves three things on
 that address: the dashboard at `/`, Prometheus metrics at `/metrics`, and a
 health check at `/health`.
+
+### Distributed tracing (optional)
+
+Build with the `otel` cargo feature (`cargo build --release --features otel`)
+to export OpenTelemetry traces over OTLP/gRPC: each block gets a `prove_block`
+span covering fetch, build, submit, and the proving wait, closed with the
+block's outcome; the trace id is stored on the block's status record. The
+exporter reads the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable — when
+unset, tracing stays off and behavior is identical to a build without the
+feature. `OTEL_SERVICE_NAME` overrides the default service name
+`proofessoor`.
 
 ### `status` — read what was recorded
 

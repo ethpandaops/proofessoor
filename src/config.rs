@@ -7,6 +7,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use url::Url;
@@ -153,6 +154,16 @@ pub struct StreamArgs {
     /// Directory of built dashboard assets to serve at / (e.g. frontend/dist).
     #[arg(long)]
     pub ui_dir: Option<PathBuf>,
+
+    /// How long a submitted proof may stay silent before reconciliation marks
+    /// it failed with reason "Unresolved". Budget zkBoost's whole pipeline:
+    /// witness_timeout + worst-case queue wait + proof_timeout. The queue
+    /// wait is unbounded under proving backlog (proof_timeout bounds only the
+    /// prove call itself), so leave generous headroom. Silence only accrues
+    /// while zkBoost is observably reachable; verdicts are deferred entirely
+    /// while it is not. Accepts seconds, or s/m/h suffixes (e.g. 900, 900s, 15m).
+    #[arg(long, default_value = "900s", value_parser = parse_duration)]
+    pub reconcile_after: Duration,
 }
 
 /// Arguments for `proofessoor check`.
@@ -282,6 +293,28 @@ fn parse_proof_type(value: &str) -> Result<ProofTypeName, String> {
     ProofTypeName::parse(value)
 }
 
+/// clap value parser for durations: plain seconds, or an integer suffixed
+/// with `s` (seconds), `m` (minutes), or `h` (hours).
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    let (digits, unit_secs) = if let Some(digits) = value.strip_suffix('s') {
+        (digits, 1)
+    } else if let Some(digits) = value.strip_suffix('m') {
+        (digits, 60)
+    } else if let Some(digits) = value.strip_suffix('h') {
+        (digits, 3600)
+    } else {
+        (value, 1)
+    };
+    let amount: u64 = digits.trim().parse().map_err(|_| {
+        format!("invalid duration '{value}': expected seconds or an s/m/h-suffixed integer")
+    })?;
+    amount
+        .checked_mul(unit_secs)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("duration '{value}' overflows"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +371,24 @@ mod tests {
             ProofTypeName::parse("  ethrex-sp1  ").map(|p| p.as_str().to_string()),
             Ok("ethrex-sp1".to_string())
         );
+    }
+
+    #[test]
+    fn duration_parses_seconds_and_suffixes() {
+        assert_eq!(parse_duration("180"), Ok(Duration::from_secs(180)));
+        assert_eq!(parse_duration("300s"), Ok(Duration::from_secs(300)));
+        assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
+        assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
+        assert_eq!(parse_duration(" 90s "), Ok(Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn duration_rejects_malformed_values() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("1.5s").is_err());
+        assert!(parse_duration("-5s").is_err());
+        assert!(parse_duration("5d").is_err());
     }
 
     #[test]

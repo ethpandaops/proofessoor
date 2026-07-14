@@ -19,8 +19,24 @@ use url::Url;
 use crate::config::BlockId;
 use crate::metrics::REQUEST_STAGE_DURATION;
 
-/// Default timeout applied to Beacon API requests.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on establishing a TCP connection to the Beacon API.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on each socket read. This is the hang detector for both unary calls
+/// and the long-lived SSE event stream. The Beacon API event stream carries no
+/// keep-alive comments — with `topics=block` an event arrives roughly every
+/// slot (12s) — so 120s (~10 empty slots) separates a dead connection from a
+/// quiet chain. A *total* request timeout would instead kill the healthy
+/// event stream on schedule (it did, every 30s), dropping the blocks that
+/// land in each reconnect gap.
+///
+/// Known residual gap (accepted): a chain that goes eventless for longer than
+/// this — devnet lulls, non-finality stretches of empty slots — tears down a
+/// healthy stream on schedule, and any block landing inside the reconnect
+/// window is never requested: there is no backfill on reconnect, the stream
+/// only carries blocks arriving after it opens. Backfill-on-reconnect is the
+/// eventual fix if missed blocks matter on such chains.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Header carrying the consensus fork used to encode an SSZ beacon block.
 const CONSENSUS_VERSION_HEADER: &str = "Eth-Consensus-Version";
@@ -92,9 +108,11 @@ fn build_header_map(headers: &[String]) -> Result<HeaderMap> {
         if trimmed.is_empty() {
             continue;
         }
-        let (name, value) = trimmed.split_once(':').with_context(|| {
-            format!("invalid beacon header '{trimmed}': expected 'Name: Value'")
-        })?;
+        // Never echo the raw entry here: with the colon missing there is no
+        // way to tell name from value, and the value may be a secret (API key).
+        let (name, value) = trimmed.split_once(':').context(
+            "invalid beacon header: expected 'Name: Value' (content redacted; it may contain a secret)",
+        )?;
         let name: HeaderName = name
             .trim()
             .parse()
@@ -115,7 +133,8 @@ impl Client {
     /// entries are ignored, so an unset PROOFESSOOR_BEACON_HEADER is fine.
     pub fn new(endpoint: Url, headers: &[String]) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .default_headers(build_header_map(headers)?)
             .build()
             .context("failed to build Beacon API HTTP client")?;
@@ -220,7 +239,11 @@ mod tests {
     }
 
     #[test]
-    fn build_header_map_rejects_missing_colon() {
-        assert!(build_header_map(&["X-API-Key secret".to_string()]).is_err());
+    fn build_header_map_rejects_missing_colon_without_echoing_the_value() {
+        let error = build_header_map(&["X-API-Key hunter2".to_string()])
+            .expect_err("missing colon must be rejected");
+        // A colonless entry cannot be split into name and value, so the whole
+        // string — possibly a secret — must stay out of the error.
+        assert!(!format!("{error:#}").contains("hunter2"));
     }
 }

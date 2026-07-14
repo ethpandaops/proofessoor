@@ -21,6 +21,14 @@ pub const PROOF_REQUEST_FAILURES: &str = "proofessoor_proof_request_failures_tot
 pub const PROOF_COMPLETIONS: &str = "proofessoor_proof_completions_total";
 /// Total proofs that failed.
 pub const PROOF_FAILURES: &str = "proofessoor_proof_failures_total";
+/// Total proofs resolved by reconciliation after a watcher reconnect
+/// (labeled by verdict: complete, unresolved).
+pub const RECONCILE_ACTIONS: &str = "proofessoor_reconcile_actions_total";
+/// Total proof events discarded because the proof had already resolved
+/// (labeled by kind: completion, failure). A nonzero rate here means outcomes
+/// are arriving after the record was judged — most importantly the truth
+/// arriving after reconciliation wrote a false `Unresolved` verdict.
+pub const LATE_EVENTS_DISCARDED: &str = "proofessoor_late_events_discarded_total";
 /// Currently outstanding proof jobs (submitted, unresolved; one per proof type).
 pub const INFLIGHT_REQUESTS: &str = "proofessoor_inflight_requests";
 /// Highest slot for which a proof was requested.
@@ -75,6 +83,14 @@ fn register() {
     );
     describe_counter!(PROOF_COMPLETIONS, "Total proofs that completed");
     describe_counter!(PROOF_FAILURES, "Total proofs that failed");
+    describe_counter!(
+        RECONCILE_ACTIONS,
+        "Total proofs resolved by reconciliation after a watcher reconnect"
+    );
+    describe_counter!(
+        LATE_EVENTS_DISCARDED,
+        "Total proof events discarded because the proof had already resolved"
+    );
     describe_gauge!(INFLIGHT_REQUESTS, "Currently outstanding proof jobs");
     describe_gauge!(LATEST_REQUESTED_SLOT, "Highest slot requested");
     describe_gauge!(LATEST_SEEN_SLOT, "Highest slot seen from the event stream");

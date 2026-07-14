@@ -1,15 +1,61 @@
 // Pure derivations over BlockRecords — no DOM, no fetch, no reactivity — so the
 // timing math and the cadence/scaling logic can be unit-tested in isolation.
 
-import type { BlockRecord } from './types'
+import type { BlockRecord, Outcome, ProofRecord } from './types'
 
-export const prepMs = (r: BlockRecord) => r.requested_at_ms - r.observed_at_ms
+/**
+ * Derived block outcome, worst-of across proofs — mirrors the backend: any
+ * failed proof fails the block; otherwise any unresolved proof keeps it in
+ * flight; otherwise every proof completed.
+ */
+export const outcome = (r: BlockRecord): Outcome => {
+  let derived: Outcome = 'complete'
+  for (const p of r.proofs) {
+    if (p.outcome === 'failed') return 'failed'
+    if (p.outcome === 'sent') derived = 'sent'
+  }
+  return derived
+}
 
-export const provingMs = (r: BlockRecord): number | null =>
-  r.resolved_at_ms === null ? null : r.resolved_at_ms - r.requested_at_ms
+/** The first failed proof's failure category, if any proof failed. */
+export const failureReason = (r: BlockRecord): string | null =>
+  r.proofs.find((p) => p.outcome === 'failed')?.reason ?? null
 
-export const e2eMs = (r: BlockRecord): number | null =>
-  r.resolved_at_ms === null ? null : r.resolved_at_ms - r.observed_at_ms
+/** The requested proof types, in request order. */
+export const proofTypes = (r: BlockRecord): string[] => r.proofs.map((p) => p.proof_type)
+
+/** When the request was submitted: the earliest submission across proofs. */
+export const requestedAtMs = (r: BlockRecord): number =>
+  r.proofs.length ? Math.min(...r.proofs.map((p) => p.requested_at_ms)) : r.observed_at_ms
+
+/**
+ * When the block resolved: the latest proof resolution, present only once
+ * every proof has resolved — mirrors the backend derivation.
+ */
+export const resolvedAtMs = (r: BlockRecord): number | null => {
+  let latest: number | null = null
+  for (const p of r.proofs) {
+    if (p.resolved_at_ms === null) return null
+    latest = latest === null ? p.resolved_at_ms : Math.max(latest, p.resolved_at_ms)
+  }
+  return latest
+}
+
+export const prepMs = (r: BlockRecord) => requestedAtMs(r) - r.observed_at_ms
+
+export const provingMs = (r: BlockRecord): number | null => {
+  const resolved = resolvedAtMs(r)
+  return resolved === null ? null : resolved - requestedAtMs(r)
+}
+
+export const e2eMs = (r: BlockRecord): number | null => {
+  const resolved = resolvedAtMs(r)
+  return resolved === null ? null : resolved - r.observed_at_ms
+}
+
+/** One proof's submit-to-resolution duration, if it has resolved. */
+export const proofDurationMs = (p: ProofRecord): number | null =>
+  p.resolved_at_ms === null ? null : p.resolved_at_ms - p.requested_at_ms
 
 export const fmt = (ms: number | null) => (ms === null ? '—' : `${ms} ms`)
 
@@ -32,7 +78,7 @@ export interface Domain {
 
 /** Fastest/slowest end-to-end among completed blocks — the log-scaling domain. */
 export const e2eDomain = (blocks: BlockRecord[]): Domain => {
-  const xs = blocks.filter((b) => b.outcome === 'complete').map((b) => e2eMs(b)!)
+  const xs = blocks.filter((b) => outcome(b) === 'complete').map((b) => e2eMs(b)!)
   if (!xs.length) return { min: 1000, max: 3000 }
   return { min: Math.min(...xs), max: Math.max(...xs) }
 }
@@ -87,7 +133,7 @@ export interface ProvingStats {
 
 /** Fastest, median, and slowest proving times across all completed blocks. */
 export const provingStats = (blocks: BlockRecord[]): ProvingStats | null => {
-  const done = blocks.filter((b) => b.outcome === 'complete')
+  const done = blocks.filter((b) => outcome(b) === 'complete')
   if (!done.length) return null
   const sorted = [...done].sort((a, b) => provingMs(a)! - provingMs(b)!)
   return {

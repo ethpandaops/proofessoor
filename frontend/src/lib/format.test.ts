@@ -1,40 +1,100 @@
 import { describe, expect, it } from 'vitest'
-import type { BlockRecord, Outcome } from './types'
+import type { BlockRecord, Outcome, ProofRecord } from './types'
 import {
   barHeight,
   buildCadence,
   e2eDomain,
   e2eMs,
+  failureReason,
+  outcome,
   prepMs,
+  proofDurationMs,
   provingMs,
   provingStats,
   shortRoot,
   splitPct,
 } from './format'
 
-// A completed record observed at `observed`, submitted +prep, resolved +proving.
+// One proof in the given state, submitted at `requested`, resolved +proving.
+function proof(
+  proofType: string,
+  requested: number,
+  proving: number,
+  state: Outcome,
+  reason: string | null = null,
+): ProofRecord {
+  return {
+    proof_type: proofType,
+    outcome: state,
+    stage: state === 'failed' ? 'proving' : null,
+    reason,
+    error: null,
+    requested_at_ms: requested,
+    resolved_at_ms: state === 'sent' ? null : requested + proving,
+    queue_ms: null,
+    prove_ms: null,
+    attempt: 1,
+  }
+}
+
+// A record observed at `observed` whose proofs were submitted +prep and each
+// resolved +proving (block outcome derives worst-of from the proof states).
 function block(
   slot: number,
   opts: { observed?: number; prep?: number; proving?: number; outcome?: Outcome } = {},
 ): BlockRecord {
   const { observed = 1000, prep = 500, proving = 1500, outcome = 'complete' } = opts
-  const requested = observed + prep
-  const resolved = outcome === 'sent' ? null : requested + proving
   return {
     slot,
     beacon_block_root: '0xbeacon',
     execution_block_number: slot - 1,
+    execution_block_hash: '0xexechash',
     new_payload_request_root: `0x${slot.toString(16).padStart(64, '0')}`,
-    proof_types: ['reth-zisk'],
-    outcome,
-    stage: null,
-    reason: null,
-    error: null,
     observed_at_ms: observed,
-    requested_at_ms: requested,
-    resolved_at_ms: resolved,
+    trace_id: null,
+    witness_ms: null,
+    proofs: [proof('reth-zisk', observed + prep, proving, outcome)],
   }
 }
+
+describe('outcome', () => {
+  // Multi-proof block with explicit per-proof states.
+  const multi = (states: [Outcome, Outcome]): BlockRecord => ({
+    ...block(1),
+    proofs: [proof('reth-zisk', 1500, 1500, states[0]), proof('ethrex-sp1', 1500, 2500, states[1])],
+  })
+
+  it('derives worst-of across proofs, mirroring the backend', () => {
+    expect(outcome(multi(['complete', 'complete']))).toBe('complete')
+    expect(outcome(multi(['complete', 'sent']))).toBe('sent')
+    expect(outcome(multi(['sent', 'failed']))).toBe('failed')
+    expect(outcome(multi(['complete', 'failed']))).toBe('failed')
+  })
+
+  it('reports the first failed proof reason', () => {
+    const failing = {
+      ...block(1),
+      proofs: [
+        proof('reth-zisk', 1500, 1500, 'complete'),
+        proof('ethrex-sp1', 1500, 2500, 'failed', 'WitnessTimeout'),
+      ],
+    }
+    expect(failureReason(failing)).toBe('WitnessTimeout')
+    expect(failureReason(block(1))).toBeNull()
+  })
+
+  it('resolves block timing only when every proof resolved', () => {
+    const half = multi(['complete', 'sent'])
+    expect(e2eMs(half)).toBeNull()
+    expect(provingMs(half)).toBeNull()
+
+    // Fully resolved: the block resolves at the slowest proof (+2500).
+    const done = multi(['complete', 'complete'])
+    expect(provingMs(done)).toBe(2500)
+    expect(proofDurationMs(done.proofs[0])).toBe(1500)
+    expect(proofDurationMs(done.proofs[1])).toBe(2500)
+  })
+})
 
 describe('timing', () => {
   it('derives prep, proving, and end-to-end', () => {
