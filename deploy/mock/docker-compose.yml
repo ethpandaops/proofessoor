@@ -9,7 +9,8 @@
 #
 # Prerequisites:
 #   - An EL RPC that serves debug_executionWitnessByBlockHash for the blocks you
-#     prove (e.g. a hoodi reth supernode). Set el_endpoint in zkboost.toml.
+#     prove (e.g. a hoodi reth supernode). Set el_endpoint in
+#     zkboost.local.toml.
 #   - A Beacon API proofessoor reads blocks from. Set BEACON_URL in .env.
 #
 # Run (published proofessoor image):
@@ -24,19 +25,15 @@ name: proofessoor-mock
 
 services:
   zkboost:
-    # Override with an image built from the matching zkBoost source revision to
-    # exercise distributed tracing and failure replay. Upstream 0.9.0 remains
-    # API-compatible but does not include those extensions.
+    # proofessoor uses the v0.9 API. Override the image to pin a newer revision
+    # or enable optional integrations not present in the default image.
     image: ${ZKBOOST_IMAGE:-ghcr.io/eth-act/zkboost/zkboost:0.9.0}
     restart: unless-stopped
     command: ["--config", "/config/zkboost.toml"]
     environment:
       RUST_LOG: "info,zkboost=debug"
     volumes:
-      - ./zkboost.toml:/config/zkboost.toml:ro
-      # If your EL doesn't serve debug_chainConfig, generate its genesis config
-      # (see README) and uncomment to let zkBoost load it:
-      # - ./hoodi_chain_config.json:/config/hoodi_chain_config.json:ro
+      - ${ZKBOOST_CONFIG:-./zkboost.toml}:/config/zkboost.toml:ro
     ports:
       - "3000:3000" # zkboost API + /dashboard
 

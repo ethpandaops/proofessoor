@@ -8,8 +8,15 @@ el_endpoint = "http://CHANGE-ME-hoodi-el:8545"
 # zkBoost gets the execution-layer genesis config via debug_chainConfig to
 # complete and validate the ChainConfig carried by each request. If your EL
 # doesn't serve it, generate the EL genesis config (see README) and uncomment:
-# chain_config_path = "/config/hoodi_chain_config.json"
+# chain_config_path = "/config/chain_config.json"
 witness_timeout_secs = 12
+
+# Optional headers applied to every EL JSON-RPC request. Use only the header
+# required by your provider, and put credentials in ignored zkboost.local.toml.
+# Requires a zkBoost build that supports custom EL headers.
+# [el_headers]
+# X-API-Key = "replace-me"
+# Authorization = "Bearer replace-me"
 
 [dashboard]
 enabled = true          # served at http://localhost:3000/dashboard (off by default)

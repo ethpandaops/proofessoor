@@ -17,7 +17,9 @@ a second `[[zkvm]]` block pointing at it (give it different `device_ids`).
   - an **EL RPC** that serves `debug_executionWitnessByBlockHash` (e.g. a hoodi
     reth supernode) — zkBoost fetches the witness here; a rate-limited public RPC
     causes `WitnessTimeout`.
-  - a **Beacon API** — proofessoor reads blocks here.
+  - a **Beacon API** that serves blocks, `/eth/v1/config/spec`, and
+    `/eth/v1/beacon/genesis` — proofessoor reads the fork schedule once at
+    startup.
 
 ## Quick start
 
@@ -26,7 +28,9 @@ a second `[[zkvm]]` block pointing at it (give it different `device_ids`).
 cp .env.example .env
 #    then edit .env -> BEACON_URL
 
-# 2. set your EL endpoint in zkboost.toml -> el_endpoint
+# 2. create the ignored operator config and set its EL endpoint
+cp zkboost.toml zkboost.local.toml
+#    then edit zkboost.local.toml -> el_endpoint
 
 # 3. build proofessoor from source and start the stack
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
@@ -35,8 +39,30 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
 Once the image is published, the base file alone (`docker compose up -d`) pulls
 it instead of building (set `PROOFESSOOR_IMAGE` to pin a version).
 
+For an authenticated EL, uncomment `[el_headers]` in `zkboost.local.toml` and
+set only the header your provider requires. Keep that ignored file private.
+
+### Run with local observability
+
+The shared observability overlay exports proofessoor and zkBoost traces over
+OTLP to Tempo, scrapes both services with Prometheus, and provisions both data
+sources in Grafana:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.local.yml \
+  -f ../docker-compose.observability.yml \
+  up --build -d
+```
+
+The default local endpoints are:
+
 | What | URL |
 | --- | --- |
+| Grafana | http://localhost:13002 |
+| Prometheus | http://localhost:19090 |
+| Tempo API | http://localhost:13200 |
 | proofessoor dashboard | http://localhost:19100 |
 | zkboost dashboard | http://localhost:3000/dashboard |
 
@@ -54,8 +80,20 @@ curl -s https://raw.githubusercontent.com/eth-clients/hoodi/main/metadata/genesi
   | jq '.config' > hoodi_chain_config.json
 ```
 
-then uncomment `chain_config_path` in `zkboost.toml` and its mount in
-`docker-compose.yml`. Regenerate it if the network schedules a new fork.
+Set `chain_config_path = "/config/chain_config.json"` in your ignored
+`zkboost.local.toml`, then add the shared overlay when starting the stack:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.local.yml \
+  -f ../docker-compose.chain-config.yml \
+  -f ../docker-compose.observability.yml \
+  up --build -d
+```
+
+Set `ZKBOOST_CHAIN_CONFIG` in `.env` when the file is not
+`./hoodi_chain_config.json`. Regenerate it if the network schedules a new fork.
 
 ## Notes
 

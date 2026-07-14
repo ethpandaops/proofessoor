@@ -1,0 +1,4 @@
+services:
+  zkboost:
+    volumes:
+      - ${ZKBOOST_CHAIN_CONFIG:-./hoodi_chain_config.json}:/config/chain_config.json:ro

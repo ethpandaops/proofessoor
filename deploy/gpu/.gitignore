@@ -1,4 +1,6 @@
 # Operator-specific; never commit.
 .env
+# Operator-specific zkBoost endpoints/headers; copy from zkboost.toml.
+zkboost.local.toml
 # Generated per-network (see README); not bundled.
 *_chain_config.json
