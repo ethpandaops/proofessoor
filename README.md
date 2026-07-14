@@ -146,10 +146,10 @@ health check at `/health`.
 
 ### Distributed tracing (optional)
 
-Build with the `otel` cargo feature (`cargo build --release --features otel`)
-to export OpenTelemetry traces over OTLP/gRPC: each block gets a `prove_block`
-span covering fetch, build, submit, and the proving wait, closed with the
-block's outcome; the trace id is stored on the block's status record. The
+Release and Docker images include the optional `otel` support; for a manual
+build, enable it with `cargo build --release --features otel`. Each block gets a
+`prove_block` span covering fetch, build, submit, and the proving wait, closed
+with the block's outcome; the trace id is stored on the block's status record. The
 exporter reads the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable — when
 unset, tracing stays off and behavior is identical to a build without the
 feature. `OTEL_SERVICE_NAME` overrides the default service name
