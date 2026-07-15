@@ -52,8 +52,8 @@ url = "2.5"
 # types, and Cargo treats identical types from different Git sources as distinct.
 # This revision is v0.9.0 plus the trace-propagation and terminal-event replay
 # extensions proofessoor integrates with; the exact rev keeps builds reproducible.
-zkboost-client = { git = "https://github.com/chetanyb/zkboost", rev = "121b537d8882036cf1b7bd56e8c521891b089841" }
-zkboost-types = { git = "https://github.com/chetanyb/zkboost", rev = "121b537d8882036cf1b7bd56e8c521891b089841" }
+zkboost-client = { git = "https://github.com/eth-act/zkboost", rev = "f22f62f304d03aff8d04b01933b778e820a11d28" }
+zkboost-types = { git = "https://github.com/eth-act/zkboost", rev = "f22f62f304d03aff8d04b01933b778e820a11d28" }
 
 [dev-dependencies]
 # In-memory span exporter for the otel-gated span tests; compiled for tests

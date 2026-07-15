@@ -4732,7 +4732,7 @@ dependencies = [
 [[package]]
 name = "zkboost-client"
 version = "0.9.0"
-source = "git+https://github.com/chetanyb/zkboost?rev=121b537d8882036cf1b7bd56e8c521891b089841#121b537d8882036cf1b7bd56e8c521891b089841"
+source = "git+https://github.com/eth-act/zkboost?rev=f22f62f304d03aff8d04b01933b778e820a11d28#f22f62f304d03aff8d04b01933b778e820a11d28"
 dependencies = [
  "async-stream",
  "bytes",
@@ -4753,7 +4753,7 @@ dependencies = [
 [[package]]
 name = "zkboost-types"
 version = "0.9.0"
-source = "git+https://github.com/chetanyb/zkboost?rev=121b537d8882036cf1b7bd56e8c521891b089841#121b537d8882036cf1b7bd56e8c521891b089841"
+source = "git+https://github.com/eth-act/zkboost?rev=f22f62f304d03aff8d04b01933b778e820a11d28#f22f62f304d03aff8d04b01933b778e820a11d28"
 dependencies = [
  "alloy-primitives",
  "ere-catalog",
