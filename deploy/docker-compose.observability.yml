@@ -1,0 +1,75 @@
+# Local integration overlay shared by the mock and GPU stacks. Traces are sent
+# to Tempo; Prometheus scrapes proofessoor and zkBoost; Grafana provisions both
+# data sources.
+
+services:
+  zkboost:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317
+      OTEL_SERVICE_NAME: zkboost
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    depends_on:
+      tempo:
+        condition: service_started
+
+  proofessoor:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317
+      OTEL_SERVICE_NAME: proofessoor
+    depends_on:
+      zkboost:
+        condition: service_healthy
+      tempo:
+        condition: service_started
+
+  prometheus:
+    image: prom/prometheus:v3.10.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-19090}:9090"
+    depends_on:
+      zkboost:
+        condition: service_healthy
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.10.3
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    volumes:
+      - ../observability/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "${TEMPO_PORT:-13200}:3200"
+      - "${OTLP_GRPC_PORT:-14317}:4317"
+      - "${OTLP_HTTP_PORT:-14318}:4318"
+    restart: unless-stopped
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.1.0}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ../observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-13002}:3000"
+    depends_on:
+      - prometheus
+      - tempo
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  tempo-data:
+  grafana-data:

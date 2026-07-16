@@ -68,7 +68,7 @@ jobs:
       # No build cache: this image is published, and restoring a cache is a
       # poisoning vector for release artifacts, so publish builds compile clean.
       - name: Build binary
-        run: cargo build --release --locked
+        run: cargo build --release --locked --features otel
 
       # Stage the prebuilt binary + the shared dashboard into a clean, tiny build
       # context so the stub's COPYs work (the repo .dockerignore excludes both).

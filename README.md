@@ -54,8 +54,11 @@ Prefer containers? See [Run the full stack](#run-the-full-stack).
 Two endpoints are always required — pass them as flags or environment variables:
 
 - **`--beacon-url`** (`PROOFESSOOR_BEACON_URL`) — your Beacon API's HTTP
-  endpoint. Supplies the blocks to prove. For an authenticated beacon, add
-  `--beacon-header "Name: Value"` (`PROOFESSOOR_BEACON_HEADER`), e.g. an API key.
+  endpoint. It must serve blocks, `/eth/v1/config/spec`, and
+  `/eth/v1/beacon/genesis`; proofessoor fetches the latter two once at startup
+  to resolve the execution fork required by zkBoost. For an authenticated
+  beacon, add `--beacon-header "Name: Value"`
+  (`PROOFESSOOR_BEACON_HEADER`), e.g. an API key.
 - **`--zkboost-url`** (`PROOFESSOOR_ZKBOOST_URL`) — your zkBoost instance's
   address. Coordinates the proving.
 
@@ -124,12 +127,10 @@ non-optimistic block. Useful flags:
   outcome arriving after a proof was already judged is discarded (records
   resolve once) but is counted in
   `proofessoor_late_events_discarded_total{kind}` and logged, so a wrong
-  verdict is observable. Missed *completions* are recovered from zkBoost's
-  replay cache,
-  but that cache holds only the most recent completions (LRU, 128 entries),
-  so an outage spanning more than ~128 completions can still lose outcomes —
-  an upstream zkBoost change to also replay failures is in flight and will be
-  the root fix for missed events.
+  verdict is observable. Missed terminal outcomes are recovered from zkBoost's
+  replay caches, but those caches hold only the most recent completions and
+  failures (LRU, 128 entries per configured zkVM by default), so an outage
+  spanning more than that replay horizon can still lose outcomes.
 
 > **Stream proves one proof type at a time.** The status model tracks each
 > proof type separately, but multi-proof streaming is unexercised end to end
@@ -143,14 +144,16 @@ health check at `/health`.
 
 ### Distributed tracing (optional)
 
-Build with the `otel` cargo feature (`cargo build --release --features otel`)
-to export OpenTelemetry traces over OTLP/gRPC: each block gets a `prove_block`
-span covering fetch, build, submit, and the proving wait, closed with the
-block's outcome; the trace id is stored on the block's status record. The
+Release and Docker images include the optional `otel` support; for a manual
+build, enable it with `cargo build --release --features otel`. Each block gets a
+`prove_block` span covering fetch, build, submit, and the proving wait, closed
+with the block's outcome; the trace id is stored on the block's status record. The
 exporter reads the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable — when
 unset, tracing stays off and behavior is identical to a build without the
 feature. `OTEL_SERVICE_NAME` overrides the default service name
-`proofessoor`.
+`proofessoor`. Outbound zkBoost calls carry the active W3C trace context; a
+zkBoost build with inbound context extraction joins those calls to the same
+distributed trace.
 
 ### `status` — read what was recorded
 

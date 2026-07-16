@@ -265,6 +265,9 @@ impl BlockRecord {
 pub struct ProofResolution {
     /// Submit-to-resolution duration for the resolved proof, in milliseconds.
     pub duration_ms: u64,
+    /// Beacon slot of the resolved proof's block, for resolving the chain
+    /// config that post-completion actions (verification) must carry.
+    pub slot: u64,
     /// The derived block outcome after this transition.
     pub block_outcome: Outcome,
     /// Whether every proof on the block has now resolved.
@@ -408,6 +411,7 @@ impl State {
         let duration_ms = now.saturating_sub(proof.requested_at_ms);
         ResolveOutcome::Transitioned(ProofResolution {
             duration_ms,
+            slot: record.slot,
             block_outcome: record.outcome(),
             block_resolved: record
                 .proofs

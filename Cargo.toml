@@ -1,6 +1,6 @@
 [package]
 name = "proofessoor"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT OR Apache-2.0"
@@ -16,6 +16,7 @@ otel = [
   "dep:opentelemetry-otlp",
   "dep:opentelemetry_sdk",
   "dep:tracing-opentelemetry",
+  "zkboost-client/otel",
 ]
 
 [dependencies]
@@ -25,15 +26,11 @@ async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
-# Must resolve to the same lighthouse source as zkboost-types, or the protocol
-# types split into two incompatible copies (a build error). Both use
-# branch = "unstable", and Cargo.lock pins the exact commit — the rev zkBoost
-# v0.8.0 and the deployed prover are built against. Two distinct cautions:
-#   - don't pin this to a rev/patch on our side alone: with zkBoost on `branch`
-#     it splits the types (use the same source on both sides instead);
-#   - don't `cargo update` past the pinned commit: the NewPayloadRequest encoding
-#     could drift from the prover and roots would mismatch at runtime.
-# --locked builds hold the pinned commit.
+# Used only to decode beacon blocks fetched from the Beacon API. Since zkBoost
+# v0.9.0 the wire types mirror execution-specs (via ere-guests) and carry no
+# lighthouse dependency, so this pin is free to move: the explicit conversion
+# in request.rs is what locks the wire encoding, guarded by its golden root
+# test. Cargo.lock pins the exact unstable commit for reproducible builds.
 lighthouse_types = { git = "https://github.com/sigp/lighthouse", branch = "unstable", package = "types" }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
@@ -45,15 +42,18 @@ reqwest-eventsource = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-ssz_types = "0.14"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-opentelemetry = { version = "0.32", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
-zkboost-client = { git = "https://github.com/eth-act/zkboost", tag = "v0.8.0" }
-zkboost-types = { git = "https://github.com/eth-act/zkboost", tag = "v0.8.0" }
+# Keep both crates on the same source: zkboost-client re-exports these protocol
+# types, and Cargo treats identical types from different Git sources as distinct.
+# This revision is v0.9.0 plus the trace-propagation and terminal-event replay
+# extensions proofessoor integrates with; the exact rev keeps builds reproducible.
+zkboost-client = { git = "https://github.com/eth-act/zkboost", rev = "f22f62f304d03aff8d04b01933b778e820a11d28" }
+zkboost-types = { git = "https://github.com/eth-act/zkboost", rev = "f22f62f304d03aff8d04b01933b778e820a11d28" }
 
 [dev-dependencies]
 # In-memory span exporter for the otel-gated span tests; compiled for tests

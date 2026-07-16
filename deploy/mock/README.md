@@ -21,7 +21,8 @@ and Beacon API**. The only thing removed is the prover.
 - An **EL RPC** that serves `debug_executionWitnessByBlockHash` (e.g. a hoodi
   reth supernode) — zkBoost fetches the witness here; a rate-limited public RPC
   causes `WitnessTimeout`.
-- A **Beacon API** — proofessoor reads blocks here.
+- A **Beacon API** that serves blocks, `/eth/v1/config/spec`, and
+  `/eth/v1/beacon/genesis` — proofessoor reads the fork schedule once at startup.
 
 ## Quick start
 
@@ -30,7 +31,9 @@ and Beacon API**. The only thing removed is the prover.
 cp .env.example .env
 #    then edit .env -> BEACON_URL
 
-# 2. set your EL endpoint in zkboost.toml -> el_endpoint
+# 2. create the ignored operator config and set its EL endpoint
+cp zkboost.toml zkboost.local.toml
+#    then edit zkboost.local.toml -> el_endpoint
 
 # 3. build proofessoor from source and start the stack
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
@@ -39,14 +42,36 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
 Once the image is published, the base file alone (`docker compose up -d`) pulls
 it instead of building (set `PROOFESSOOR_IMAGE` to pin a version).
 
+For an authenticated EL, uncomment `[el_headers]` in `zkboost.local.toml` and
+set only the header your provider requires. Keep that ignored file private.
+
+### Run with local observability
+
+The observability overlay exports proofessoor and zkBoost traces over OTLP to
+Tempo, scrapes both services with Prometheus, and provisions both data sources
+in Grafana:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.local.yml \
+  -f ../docker-compose.observability.yml \
+  up --build -d
+```
+
+The default local endpoints are:
+
 | What | URL |
 | --- | --- |
+| Grafana | http://localhost:13002 |
+| Prometheus | http://localhost:19090 |
+| Tempo API | http://localhost:13200 |
 | proofessoor dashboard | http://localhost:19100 |
 | zkboost dashboard | http://localhost:3000/dashboard |
 
 ## Tuning the mock
 
-The proving delay lives in `zkboost.toml` under `[[zkvm]]`:
+The proving delay lives in your `zkboost.local.toml` under `[[zkvm]]`:
 
 ```toml
 mock_proving_time = { kind = "random", min_ms = 2000, max_ms = 10000 }
@@ -63,19 +88,32 @@ will time out — keep the timeout comfortably larger.
 
 ## Chain config
 
-zkBoost gets the chain config straight from your EL via `debug_chainConfig`, so
-with a proper EL there's nothing to set — whatever chain the EL runs is what gets
-executed. Some public RPCs don't serve that method; if yours doesn't, generate
-the config for your network and point zkBoost at it (hoodi shown — swap `hoodi`
-for your network):
+Each proof request carries the active fork derived by proofessoor from the
+Beacon API. zkBoost separately reads the execution-layer genesis config via
+`debug_chainConfig` to complete and validate the execution-only blob parameters.
+With a proper EL there is nothing to set. Some public RPCs do not serve that
+method; if yours does not, generate the EL genesis config for your network and
+point zkBoost at it (hoodi shown — swap `hoodi` for your network):
 
 ```bash
 curl -s https://raw.githubusercontent.com/eth-clients/hoodi/main/metadata/genesis.json \
   | jq '.config' > hoodi_chain_config.json
 ```
 
-then uncomment `chain_config_path` in `zkboost.toml` and its mount in
-`docker-compose.yml`. Regenerate it if the network schedules a new fork.
+Set `chain_config_path = "/config/chain_config.json"` in your ignored
+`zkboost.local.toml`, then add the shared overlay when starting the stack:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.local.yml \
+  -f ../docker-compose.chain-config.yml \
+  -f ../docker-compose.observability.yml \
+  up --build -d
+```
+
+Set `ZKBOOST_CHAIN_CONFIG` in `.env` when the file is not
+`./hoodi_chain_config.json`. Regenerate it if the network schedules a new fork.
 
 ## Notes
 

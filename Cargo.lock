@@ -540,7 +540,7 @@ dependencies = [
 [[package]]
 name = "bls"
 version = "0.2.0"
-source = "git+https://github.com/sigp/lighthouse?branch=unstable#9c4715c251ea19b2cc4c7688916b5cddfa2b1778"
+source = "git+https://github.com/sigp/lighthouse?branch=unstable#e2bdcf0fe6514d52c6e1f15eafed0f5cb2af6a03"
 dependencies = [
  "alloy-primitives",
  "blst",
@@ -609,19 +609,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "c-kzg"
-version = "2.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6648ed1e4ea8e8a1a4a2c78e1cda29a3fd500bc622899c340d8525ea9a76b24a"
-dependencies = [
- "blst",
- "cc",
- "glob",
- "hex",
- "libc",
 ]
 
 [[package]]
@@ -1242,8 +1229,8 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "ere-catalog"
-version = "0.12.1"
-source = "git+https://github.com/eth-act/ere?tag=v0.12.1#628fa3c49941704d72e7b0e038e7bce5b6d2cd58"
+version = "0.13.0"
+source = "git+https://github.com/eth-act/ere?tag=v0.13.0#fcbf0dc8a2e1ea2af43cf0158a92dfbd33871fe0"
 dependencies = [
  "ere-util-build",
  "serde",
@@ -1252,8 +1239,8 @@ dependencies = [
 
 [[package]]
 name = "ere-util-build"
-version = "0.12.1"
-source = "git+https://github.com/eth-act/ere?tag=v0.12.1#628fa3c49941704d72e7b0e038e7bce5b6d2cd58"
+version = "0.13.0"
+source = "git+https://github.com/eth-act/ere?tag=v0.13.0#fcbf0dc8a2e1ea2af43cf0158a92dfbd33871fe0"
 dependencies = [
  "cargo_metadata",
 ]
@@ -1271,14 +1258,14 @@ dependencies = [
 [[package]]
 name = "eth2_interop_keypairs"
 version = "0.2.0"
-source = "git+https://github.com/sigp/lighthouse?branch=unstable#9c4715c251ea19b2cc4c7688916b5cddfa2b1778"
+source = "git+https://github.com/sigp/lighthouse?branch=unstable#e2bdcf0fe6514d52c6e1f15eafed0f5cb2af6a03"
 dependencies = [
  "bls",
  "ethereum_hashing",
  "hex",
  "num-bigint",
  "serde",
- "serde_yaml",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -1404,7 +1391,7 @@ dependencies = [
 [[package]]
 name = "fixed_bytes"
 version = "0.1.0"
-source = "git+https://github.com/sigp/lighthouse?branch=unstable#9c4715c251ea19b2cc4c7688916b5cddfa2b1778"
+source = "git+https://github.com/sigp/lighthouse?branch=unstable#e2bdcf0fe6514d52c6e1f15eafed0f5cb2af6a03"
 dependencies = [
  "alloy-primitives",
  "safe_arith",
@@ -1993,7 +1980,7 @@ dependencies = [
 [[package]]
 name = "int_to_bytes"
 version = "0.2.0"
-source = "git+https://github.com/sigp/lighthouse?branch=unstable#9c4715c251ea19b2cc4c7688916b5cddfa2b1778"
+source = "git+https://github.com/sigp/lighthouse?branch=unstable#e2bdcf0fe6514d52c6e1f15eafed0f5cb2af6a03"
 dependencies = [
  "bytes",
 ]
@@ -2115,9 +2102,8 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 [[package]]
 name = "kzg"
 version = "0.1.0"
-source = "git+https://github.com/sigp/lighthouse?branch=unstable#9c4715c251ea19b2cc4c7688916b5cddfa2b1778"
+source = "git+https://github.com/sigp/lighthouse?branch=unstable#e2bdcf0fe6514d52c6e1f15eafed0f5cb2af6a03"
 dependencies = [
- "c-kzg",
  "educe",
  "ethereum_hashing",
  "ethereum_serde_utils",
@@ -2149,6 +2135,53 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "libssz"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d498c0482bba87d2647ea4601ea76cf2b498065e3958798a88f49274f3ced5e9"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
+name = "libssz-derive"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ddfb5c969c28a4a54043e630f80c723352637bd1020f256ee3ac7a8814922b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "libssz-merkle"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63c6d6d5ce5d79bba66bc98c99869eedffedf7f14f0aa0915f1a62802650bdf6"
+dependencies = [
+ "libssz",
+ "sha2",
+]
+
+[[package]]
+name = "libssz-types"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "747273ab2d923e82ed147091fe0fb3e602dd2012c872cdad5efe69e27c3b4099"
+dependencies = [
+ "libssz",
+ "libssz-merkle",
+ "smallvec",
+]
+
+[[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
 
 [[package]]
 name = "linux-raw-sys"
@@ -2207,7 +2240,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 [[package]]
 name = "merkle_proof"
 version = "0.2.0"
-source = "git+https://github.com/sigp/lighthouse?branch=unstable#9c4715c251ea19b2cc4c7688916b5cddfa2b1778"
+source = "git+https://github.com/sigp/lighthouse?branch=unstable#e2bdcf0fe6514d52c6e1f15eafed0f5cb2af6a03"
 dependencies = [
  "alloy-primitives",
  "ethereum_hashing",
@@ -2726,7 +2759,7 @@ dependencies = [
 
 [[package]]
 name = "proofessoor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2744,7 +2777,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "ssz_types",
  "tokio",
  "tower-http",
  "tracing",
@@ -3451,19 +3483,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3592,6 +3611,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "stateless-validator-common"
+version = "0.13.0"
+source = "git+https://github.com/eth-act/ere-guests?tag=v0.13.0#cffc3f1a299e0e5f097305775d6ba1141b5f9546"
+dependencies = [
+ "const-hex",
+ "libssz",
+ "libssz-derive",
+ "libssz-merkle",
+ "libssz-types",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3647,7 +3680,7 @@ dependencies = [
 [[package]]
 name = "swap_or_not_shuffle"
 version = "0.2.0"
-source = "git+https://github.com/sigp/lighthouse?branch=unstable#9c4715c251ea19b2cc4c7688916b5cddfa2b1778"
+source = "git+https://github.com/sigp/lighthouse?branch=unstable#e2bdcf0fe6514d52c6e1f15eafed0f5cb2af6a03"
 dependencies = [
  "alloy-primitives",
  "ethereum_hashing",
@@ -3734,15 +3767,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "test_random_derive"
-version = "0.2.0"
-source = "git+https://github.com/sigp/lighthouse?branch=unstable#9c4715c251ea19b2cc4c7688916b5cddfa2b1778"
-dependencies = [
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -4137,7 +4161,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "types"
 version = "0.2.1"
-source = "git+https://github.com/sigp/lighthouse?branch=unstable#9c4715c251ea19b2cc4c7688916b5cddfa2b1778"
+source = "git+https://github.com/sigp/lighthouse?branch=unstable#e2bdcf0fe6514d52c6e1f15eafed0f5cb2af6a03"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -4160,6 +4184,7 @@ dependencies = [
  "metastruct",
  "milhouse",
  "parking_lot",
+ "paste",
  "rand 0.9.4",
  "rand_xorshift 0.4.0",
  "rayon",
@@ -4168,17 +4193,16 @@ dependencies = [
  "safe_arith",
  "serde",
  "serde_json",
- "serde_yaml",
  "smallvec",
  "ssz_types",
  "superstruct",
  "swap_or_not_shuffle",
  "tempfile",
- "test_random_derive",
  "tracing",
  "tree_hash",
  "tree_hash_derive",
  "typenum",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -4228,12 +4252,6 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
@@ -4581,6 +4599,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "yaml_serde"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c7c1b1a6a7c8a6b2741a6c21a4f8918e51899b111cfa08d1288202656e3975"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4700,38 +4731,38 @@ dependencies = [
 
 [[package]]
 name = "zkboost-client"
-version = "0.8.0"
-source = "git+https://github.com/eth-act/zkboost?tag=v0.8.0#b4ecbdedbe7f61cade813f0c1506d2066bf61256"
+version = "0.9.0"
+source = "git+https://github.com/eth-act/zkboost?rev=f22f62f304d03aff8d04b01933b778e820a11d28#f22f62f304d03aff8d04b01933b778e820a11d28"
 dependencies = [
  "async-stream",
  "bytes",
  "futures",
+ "opentelemetry",
  "reqwest",
  "reqwest-eventsource",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio-stream",
+ "tracing",
+ "tracing-opentelemetry",
  "url",
  "zkboost-types",
 ]
 
 [[package]]
 name = "zkboost-types"
-version = "0.8.0"
-source = "git+https://github.com/eth-act/zkboost?tag=v0.8.0#b4ecbdedbe7f61cade813f0c1506d2066bf61256"
+version = "0.9.0"
+source = "git+https://github.com/eth-act/zkboost?rev=f22f62f304d03aff8d04b01933b778e820a11d28#f22f62f304d03aff8d04b01933b778e820a11d28"
 dependencies = [
+ "alloy-primitives",
  "ere-catalog",
- "ethereum_ssz",
- "ethereum_ssz_derive",
+ "libssz",
+ "libssz-derive",
  "serde",
  "serde_json",
- "ssz_types",
+ "stateless-validator-common",
  "strum",
- "superstruct",
- "tree_hash",
- "tree_hash_derive",
- "types",
 ]
 
 [[package]]

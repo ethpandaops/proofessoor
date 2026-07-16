@@ -24,7 +24,7 @@ WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked \
+    cargo build --release --locked --features otel \
     && cp target/release/proofessoor /usr/local/bin/proofessoor
 
 # Created here so the distroless runtime (no shell) can COPY it in owned by the

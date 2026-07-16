@@ -7,7 +7,8 @@
 # Prerequisites:
 #   - NVIDIA drivers + NVIDIA Container Toolkit (Docker `--gpus` / device reservations)
 #   - An EL RPC that serves debug_executionWitnessByBlockHash for the blocks you
-#     prove (e.g. a hoodi reth supernode). Set el_endpoint in zkboost.toml.
+#     prove (e.g. a hoodi reth supernode). Set el_endpoint in
+#     zkboost.local.toml.
 #
 # Run (published proofessoor image):
 #   docker compose up -d
@@ -24,13 +25,13 @@ services:
   # (slow first boot — minutes); the ere-zisk-setup volume persists it so later
   # boots skip it. The healthcheck gates dependents until it's actually listening.
   ere-server-reth-zisk:
-    image: ghcr.io/eth-act/ere/ere-server-zisk:0.12.1-cuda
+    image: ghcr.io/eth-act/ere/ere-server-zisk:0.13.0-cuda
     restart: unless-stopped
     command:
       - --port
       - "3000"
       - --elf-url
-      - https://github.com/eth-act/ere-guests/releases/download/v0.12.1/stateless-validator-reth-zisk.elf
+      - https://github.com/eth-act/ere-guests/releases/download/v0.13.0/stateless-validator-reth-zisk.elf
       - gpu
     environment:
       RUST_LOG: "info,asm_runner=warn,executor=warn,mem_planner_cpp=warn,proofman=warn,rom_setup=warn,sm_rom=warn,zisk=warn"
@@ -56,16 +57,15 @@ services:
               capabilities: [gpu]
 
   zkboost:
-    image: ghcr.io/eth-act/zkboost/zkboost:0.8.0
+    # proofessoor uses the v0.9 API. Override the image to pin a newer revision
+    # or enable optional integrations not present in the default image.
+    image: ${ZKBOOST_IMAGE:-ghcr.io/eth-act/zkboost/zkboost:0.9.0}
     restart: unless-stopped
     command: ["--config", "/config/zkboost.toml"]
     environment:
       RUST_LOG: "info,zkboost=debug"
     volumes:
-      - ./zkboost.toml:/config/zkboost.toml:ro
-      # If your EL doesn't serve debug_chainConfig (e.g. a public RPC), generate a
-      # chain config (see README) and uncomment to load it:
-      # - ./hoodi_chain_config.json:/config/hoodi_chain_config.json:ro
+      - ${ZKBOOST_CONFIG:-./zkboost.toml}:/config/zkboost.toml:ro
     ports:
       - "3000:3000" # zkboost API + /dashboard
     depends_on:
