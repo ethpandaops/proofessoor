@@ -36,8 +36,8 @@ use crate::metrics::{
 };
 use crate::request;
 use crate::status::{
-    self, BlockRecord, FailureStage, MemoryStatusStore, Outcome, ProofResolution, ResolveOutcome,
-    RetentionEviction, SqliteStatusStore, StatusStore,
+    self, BlockRecord, FailureStage, MemoryStatusStore, Outcome, ProofResolution, RecordOutcome,
+    ResolveOutcome, RetentionEviction, SqliteStatusStore, StatusStore,
 };
 use crate::zkboost::{self, ProofEvent};
 
@@ -465,9 +465,8 @@ async fn submit_block(
     // Skip blocks already requested (in this run or a previous one). The
     // check-then-record pair is not atomic: above the default --max-inflight
     // of 1, two concurrent submissions of one root could both pass it and
-    // submit twice. The store keys records by root — the second record
-    // replaces the first and events still resolve once — so the cost is a
-    // redundant submission to zkBoost, not a corrupt record.
+    // submit twice. The store preserves an existing proof row idempotently, so
+    // the cost is a redundant submission to zkBoost, not lost terminal state.
     if store.seen(&root_hex).await? {
         counter!(BLOCKS_SKIPPED).increment(1);
         span.record("outcome", "skipped");
@@ -504,8 +503,8 @@ async fn submit_block(
                 format!("{error:#}"),
             );
             record.trace_id = trace_id;
-            let evicted = store.record(record).await?;
-            close_evicted_spans(spans, &evicted);
+            let write = store.record(record).await?;
+            close_evicted_spans(spans, &write.evicted);
             span.record("outcome", "failed");
             warn!(slot = fetched.slot(), root = %local_root, %error, "proof submission failed");
             return Ok(());
@@ -529,8 +528,8 @@ async fn submit_block(
             format!("local {local_root} != server {server_root}"),
         );
         record.trace_id = trace_id;
-        let evicted = store.record(record).await?;
-        close_evicted_spans(spans, &evicted);
+        let write = store.record(record).await?;
+        close_evicted_spans(spans, &write.evicted);
         span.record("outcome", "failed");
         warn!(
             slot = fetched.slot(),
@@ -559,11 +558,18 @@ async fn submit_block(
 
     // Hold the span open before the record lands, so the watcher can never
     // resolve a record whose span handle is not registered yet.
-    register_span(spans, root_hex.clone(), span.clone());
+    let registered_span = register_span(spans, root_hex.clone(), span.clone());
     match store.record(record).await {
-        Ok(evicted) => close_evicted_spans(spans, &evicted),
+        Ok(write) => {
+            close_evicted_spans(spans, &write.evicted);
+            if write.outcome == RecordOutcome::Duplicate {
+                debug!(root = %root_hex, "duplicate request record preserved existing proof state");
+            }
+        }
         Err(error) => {
-            drop_span(spans, &root_hex);
+            if registered_span {
+                drop_span(spans, &root_hex);
+            }
             return Err(error);
         }
     }
@@ -604,14 +610,17 @@ fn current_trace_id(span: &Span) -> Option<String> {
 /// Holds a block's root span open until its terminal transition.
 ///
 /// Above `--max-inflight 1`, a duplicate submission of the same root (see the
-/// non-atomic seen-check note in [`submit_block`]) overwrites the previous
-/// handle here: the replaced span closes without an outcome recorded.
-/// Accepted — the store record is replaced the same way, so the surviving
-/// span and record stay consistent with each other.
-fn register_span(spans: &SpanRegistry, root_hex: String, span: Span) {
-    if let Ok(mut map) = spans.lock() {
-        map.insert(root_hex, span);
+/// non-atomic seen-check note in [`submit_block`]) keeps the first registered
+/// handle. This mirrors the store's idempotent preservation of existing proof
+/// state and prevents the duplicate task from dropping the authoritative span.
+fn register_span(spans: &SpanRegistry, root_hex: String, span: Span) -> bool {
+    if let Ok(mut map) = spans.lock()
+        && let std::collections::hash_map::Entry::Vacant(entry) = map.entry(root_hex)
+    {
+        entry.insert(span);
+        return true;
     }
+    false
 }
 
 /// Drops a registered span handle without recording an outcome (used when the
@@ -1598,7 +1607,7 @@ mod tests {
             Ok(false)
         }
 
-        async fn record(&self, _record: BlockRecord) -> Result<Vec<RetentionEviction>> {
+        async fn record(&self, _record: BlockRecord) -> Result<status::RecordWrite> {
             anyhow::bail!("store write failed")
         }
 
@@ -1993,8 +2002,8 @@ mod tests {
             "0xold".to_string(),
             prove_block_span(100, "0xbeacon"),
         );
-        let evicted = store.record(old).await.expect("record");
-        assert!(evicted.is_empty());
+        let write = store.record(old).await.expect("record");
+        assert!(write.evicted.is_empty());
 
         // A newer record over the history cap evicts the old unresolved one;
         // its span handle must not outlive the record.
@@ -2007,8 +2016,8 @@ mod tests {
             vec!["reth-zisk".to_string()],
             2_000,
         );
-        let evicted = store.record(newer).await.expect("record");
-        close_evicted_spans(&spans, &evicted);
+        let write = store.record(newer).await.expect("record");
+        close_evicted_spans(&spans, &write.evicted);
         assert!(spans.lock().expect("registry lock").is_empty());
     }
 

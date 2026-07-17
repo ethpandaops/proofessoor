@@ -11,8 +11,9 @@ use tracing::info;
 
 use super::{
     BlockRecord, Failure, FailureStage, Outcome, ProofRecord, ProofResolution, RecordCursor,
-    RecordFilter, RecordPage, ResolveOutcome, RetentionEviction, State, StatusStore, StatusSummary,
-    StorageStats, finish_page, now_ms, observe_retention_evictions,
+    RecordFilter, RecordOutcome, RecordPage, RecordWrite, ResolveOutcome, RetentionEviction, State,
+    StatusStore, StatusSummary, StorageStats, finish_page, now_ms, observe_retention_evictions,
+    validate_record,
 };
 
 pub(super) const DATABASE_FILE: &str = "proofessoor.sqlite";
@@ -159,7 +160,7 @@ impl SqliteStatusStore {
         }
 
         for record in state.records.values() {
-            insert_record(&mut transaction, record).await?;
+            let _ = insert_record(&mut transaction, record).await?;
         }
         let evicted = prune_requests(&mut transaction, self.max_history).await?;
         sqlx::query("INSERT INTO app_metadata (key, value) VALUES (?, ?)")
@@ -337,11 +338,13 @@ impl SqliteStatusStore {
 async fn insert_record(
     transaction: &mut Transaction<'_, Sqlite>,
     record: &BlockRecord,
-) -> Result<()> {
+) -> Result<RecordOutcome> {
+    validate_record(record)?;
     let requested_at_ms = record
         .requested_at_ms()
         .context("cannot record a request without any proof types")?;
-    sqlx::query(
+    let execution_block_number = to_i64(record.execution_block_number, "execution block number")?;
+    let inserted_request = sqlx::query(
         r#"
         INSERT INTO requests (
             request_root,
@@ -354,24 +357,13 @@ async fn insert_record(
             trace_id,
             witness_ms
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(request_root) DO UPDATE SET
-            slot = excluded.slot,
-            beacon_block_root = excluded.beacon_block_root,
-            execution_block_number = excluded.execution_block_number,
-            execution_block_hash = excluded.execution_block_hash,
-            observed_at_ms = excluded.observed_at_ms,
-            requested_at_ms = excluded.requested_at_ms,
-            trace_id = excluded.trace_id,
-            witness_ms = excluded.witness_ms
+        ON CONFLICT(request_root) DO NOTHING
         "#,
     )
     .bind(&record.new_payload_request_root)
     .bind(to_i64(record.slot, "slot")?)
     .bind(&record.beacon_block_root)
-    .bind(to_i64(
-        record.execution_block_number,
-        "execution block number",
-    )?)
+    .bind(execution_block_number)
     .bind(&record.execution_block_hash)
     .bind(to_i64(record.observed_at_ms, "observation timestamp")?)
     .bind(to_i64(requested_at_ms, "request timestamp")?)
@@ -389,21 +381,49 @@ async fn insert_record(
             "failed to store request {}",
             record.new_payload_request_root
         )
-    })?;
+    })?
+    .rows_affected()
+        == 1;
 
-    sqlx::query("DELETE FROM proofs WHERE request_root = ?")
+    if !inserted_request {
+        let existing: (i64, String) = sqlx::query_as(
+            "SELECT execution_block_number, execution_block_hash FROM requests WHERE request_root = ?",
+        )
         .bind(&record.new_payload_request_root)
-        .execute(&mut **transaction)
+        .fetch_one(&mut **transaction)
         .await
         .with_context(|| {
             format!(
-                "failed to replace proofs for request {}",
+                "failed to validate existing request {}",
                 record.new_payload_request_root
             )
         })?;
+        if existing.0 != execution_block_number || existing.1 != record.execution_block_hash {
+            bail!(
+                "request root {} conflicts with stored execution payload {} ({})",
+                record.new_payload_request_root,
+                existing.1,
+                existing.0
+            );
+        }
+    }
 
-    for (proof_index, proof) in record.proofs.iter().enumerate() {
-        sqlx::query(
+    let mut next_proof_index: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(proof_index) + 1, 0) FROM proofs WHERE request_root = ?",
+    )
+    .bind(&record.new_payload_request_root)
+    .fetch_one(&mut **transaction)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to allocate proof index for request {}",
+            record.new_payload_request_root
+        )
+    })?;
+    let mut inserted_proofs = 0_u64;
+
+    for proof in &record.proofs {
+        let result = sqlx::query(
             r#"
             INSERT INTO proofs (
                 request_root,
@@ -418,11 +438,12 @@ async fn insert_record(
                 prove_ms,
                 attempt
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(request_root, proof_type) DO NOTHING
             "#,
         )
         .bind(&record.new_payload_request_root)
         .bind(&proof.proof_type)
-        .bind(usize_to_i64(proof_index, "proof index")?)
+        .bind(next_proof_index)
         .bind(proof.outcome.as_str())
         .bind(proof.stage.map(failure_stage_name))
         .bind(&proof.reason)
@@ -454,8 +475,20 @@ async fn insert_record(
                 proof.proof_type, record.new_payload_request_root
             )
         })?;
+        if result.rows_affected() == 1 {
+            inserted_proofs += 1;
+            next_proof_index = next_proof_index
+                .checked_add(1)
+                .context("proof index exceeds SQLite INTEGER range")?;
+        }
     }
-    Ok(())
+    Ok(if inserted_request {
+        RecordOutcome::Inserted
+    } else if inserted_proofs > 0 {
+        RecordOutcome::Extended
+    } else {
+        RecordOutcome::Duplicate
+    })
 }
 
 async fn prune_requests(
@@ -560,13 +593,13 @@ impl StatusStore for SqliteStatusStore {
         Ok(seen != 0)
     }
 
-    async fn record(&self, record: BlockRecord) -> Result<Vec<RetentionEviction>> {
+    async fn record(&self, record: BlockRecord) -> Result<RecordWrite> {
         let mut transaction = self
             .pool
             .begin()
             .await
             .context("failed to begin request-status transaction")?;
-        insert_record(&mut transaction, &record).await?;
+        let outcome = insert_record(&mut transaction, &record).await?;
 
         let evicted = prune_requests(&mut transaction, self.max_history).await?;
 
@@ -575,7 +608,7 @@ impl StatusStore for SqliteStatusStore {
             .await
             .context("failed to commit request status")?;
         observe_retention_evictions(&evicted);
-        Ok(evicted)
+        Ok(RecordWrite { outcome, evicted })
     }
 
     async fn resolve_proof(

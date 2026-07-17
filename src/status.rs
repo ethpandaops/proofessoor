@@ -12,7 +12,7 @@
 //! flat, single-outcome record shape and are not readable — delete the state
 //! directory when upgrading across that boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -384,6 +384,24 @@ pub struct RetentionEviction {
     pub outstanding: bool,
 }
 
+/// How recording a request changed the durable proof set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordOutcome {
+    /// The request root and all of its proof rows were new.
+    Inserted,
+    /// The request root existed and at least one new proof type was appended.
+    Extended,
+    /// Every proof type was already recorded; terminal state was preserved.
+    Duplicate,
+}
+
+/// Result of recording a request and enforcing the history cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordWrite {
+    pub outcome: RecordOutcome,
+    pub evicted: Vec<RetentionEviction>,
+}
+
 impl RetentionEviction {
     fn kind(&self) -> &'static str {
         if self.outstanding {
@@ -413,13 +431,14 @@ pub trait StatusStore: Send + Sync {
     /// Whether a request for this `new_payload_request_root` is already recorded.
     async fn seen(&self, root: &str) -> Result<bool>;
 
-    /// Records (or replaces) a request record.
+    /// Records a request without replacing existing proof state.
     ///
-    /// Returns records evicted to honor the history cap, so the caller can
-    /// release what it holds per request (open span handles) and refresh
-    /// state-derived gauges. Settled history is selected before outstanding
-    /// work; the cap remains hard if outstanding work alone exceeds it.
-    async fn record(&self, record: BlockRecord) -> Result<Vec<RetentionEviction>>;
+    /// Existing proof keys are idempotent no-ops; new proof types are appended.
+    /// Conflicting execution metadata for the same request root is rejected.
+    /// The result also reports records evicted to honor the history cap, so the
+    /// caller can release per-request resources and refresh state-derived
+    /// gauges.
+    async fn record(&self, record: BlockRecord) -> Result<RecordWrite>;
 
     /// Resolves one proof of a recorded request to a terminal outcome.
     ///
@@ -480,9 +499,36 @@ impl State {
         self.records.contains_key(root)
     }
 
-    fn insert(&mut self, record: BlockRecord) {
-        self.records
-            .insert(record.new_payload_request_root.clone(), record);
+    fn insert(&mut self, mut record: BlockRecord) -> Result<RecordOutcome> {
+        validate_record(&record)?;
+        let root = record.new_payload_request_root.clone();
+        let Some(existing) = self.records.get_mut(&root) else {
+            self.records.insert(root, record);
+            return Ok(RecordOutcome::Inserted);
+        };
+        ensure_compatible_request(existing, &record)?;
+        let requested_at_ms = existing
+            .requested_at_ms()
+            .context("stored request has no proof submission timestamp")?;
+
+        let mut extended = false;
+        for mut proof in record.proofs.drain(..) {
+            if existing
+                .proofs
+                .iter()
+                .any(|stored| stored.proof_type == proof.proof_type)
+            {
+                continue;
+            }
+            proof.requested_at_ms = requested_at_ms;
+            existing.proofs.push(proof);
+            extended = true;
+        }
+        Ok(if extended {
+            RecordOutcome::Extended
+        } else {
+            RecordOutcome::Duplicate
+        })
     }
 
     fn resolve_proof(
@@ -620,14 +666,14 @@ impl StatusStore for MemoryStatusStore {
         Ok(self.state.lock().await.seen(root))
     }
 
-    async fn record(&self, record: BlockRecord) -> Result<Vec<RetentionEviction>> {
-        let evicted = {
+    async fn record(&self, record: BlockRecord) -> Result<RecordWrite> {
+        let (outcome, evicted) = {
             let mut state = self.state.lock().await;
-            state.insert(record);
-            state.prune(self.max_history)
+            let outcome = state.insert(record)?;
+            (outcome, state.prune(self.max_history))
         };
         observe_retention_evictions(&evicted);
-        Ok(evicted)
+        Ok(RecordWrite { outcome, evicted })
     }
 
     async fn resolve_proof(
@@ -696,6 +742,37 @@ impl StatusStore for MemoryStatusStore {
     async fn storage_stats(&self) -> Result<Option<StorageStats>> {
         Ok(None)
     }
+}
+
+fn validate_record(record: &BlockRecord) -> Result<()> {
+    if record.proofs.is_empty() {
+        bail!("cannot record a request without any proof types");
+    }
+    let mut proof_types = HashSet::with_capacity(record.proofs.len());
+    for proof in &record.proofs {
+        if !proof_types.insert(proof.proof_type.as_str()) {
+            bail!(
+                "request {} contains duplicate proof type {}",
+                record.new_payload_request_root,
+                proof.proof_type
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_compatible_request(existing: &BlockRecord, incoming: &BlockRecord) -> Result<()> {
+    if existing.execution_block_number != incoming.execution_block_number
+        || existing.execution_block_hash != incoming.execution_block_hash
+    {
+        bail!(
+            "request root {} conflicts with stored execution payload {} ({})",
+            incoming.new_payload_request_root,
+            existing.execution_block_hash,
+            existing.execution_block_number
+        );
+    }
+    Ok(())
 }
 
 fn sort_records(records: &mut [BlockRecord]) {
@@ -867,6 +944,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_record_is_idempotent_and_appends_new_proof_types() {
+        let store = MemoryStatusStore::new(0);
+        let inserted = store
+            .record(record(150, "0xroot"))
+            .await
+            .expect("insert request");
+        assert_eq!(inserted.outcome, RecordOutcome::Inserted);
+        store
+            .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+            .await
+            .expect("complete first proof");
+
+        let mut extension = multi_proof_record(150, "0xroot");
+        extension
+            .proofs
+            .iter_mut()
+            .find(|proof| proof.proof_type == "ethrex-sp1")
+            .expect("new proof type")
+            .requested_at_ms = u64::MAX;
+        let extended = store.record(extension).await.expect("extend request");
+        assert_eq!(extended.outcome, RecordOutcome::Extended);
+        let duplicate = store
+            .record(multi_proof_record(150, "0xroot"))
+            .await
+            .expect("repeat request");
+        assert_eq!(duplicate.outcome, RecordOutcome::Duplicate);
+
+        let records = store.records().await.expect("read request");
+        let stored = records.first().expect("one request");
+        let mut proofs = stored.proofs.iter();
+        let first = proofs.next().expect("first proof");
+        let second = proofs.next().expect("second proof");
+        assert!(proofs.next().is_none(), "expected exactly two proofs");
+        assert_eq!(first.proof_type, "reth-zisk");
+        assert_eq!(first.outcome, Outcome::Complete);
+        assert_eq!(second.proof_type, "ethrex-sp1");
+        assert_eq!(second.outcome, Outcome::Sent);
+        assert_eq!(second.requested_at_ms, first.requested_at_ms);
+    }
+
+    #[tokio::test]
+    async fn sqlite_record_preserves_terminal_state_and_proof_order() {
+        let dir = temp_state_dir("sqlite-idempotent-record");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        let inserted = store
+            .record(record(160, "0xroot"))
+            .await
+            .expect("insert request");
+        assert_eq!(inserted.outcome, RecordOutcome::Inserted);
+        store
+            .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+            .await
+            .expect("complete first proof");
+
+        let extended = store
+            .record(multi_proof_record(160, "0xroot"))
+            .await
+            .expect("extend request");
+        assert_eq!(extended.outcome, RecordOutcome::Extended);
+        let duplicate = store
+            .record(multi_proof_record(160, "0xroot"))
+            .await
+            .expect("repeat request");
+        assert_eq!(duplicate.outcome, RecordOutcome::Duplicate);
+
+        let records = store.records().await.expect("read request");
+        let stored = records.first().expect("one request");
+        let mut proofs = stored.proofs.iter();
+        let first = proofs.next().expect("first proof");
+        let second = proofs.next().expect("second proof");
+        assert!(proofs.next().is_none(), "expected exactly two proofs");
+        assert_eq!(first.proof_type, "reth-zisk");
+        assert_eq!(first.outcome, Outcome::Complete);
+        assert_eq!(second.proof_type, "ethrex-sp1");
+        assert_eq!(second.outcome, Outcome::Sent);
+
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_record_rejects_conflicting_payload_metadata() {
+        let dir = temp_state_dir("sqlite-conflicting-record");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        store
+            .record(record(170, "0xroot"))
+            .await
+            .expect("insert request");
+        let mut conflicting = record(170, "0xroot");
+        conflicting.execution_block_hash = "0xdifferent".to_string();
+
+        let error = store
+            .record(conflicting)
+            .await
+            .expect_err("conflicting payload must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with stored execution payload")
+        );
+        let records = store.records().await.expect("read request");
+        assert_eq!(records.len(), 1);
+        let stored = records.first().expect("one request");
+        assert_eq!(stored.execution_block_hash, "0xexechash");
+        assert_eq!(stored.proofs.len(), 1);
+
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_record_rejects_duplicate_proof_types_atomically() {
+        let dir = temp_state_dir("sqlite-duplicate-proof-types");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        let duplicate = BlockRecord::new(
+            180,
+            "0xbeacon".to_string(),
+            179,
+            "0xexechash".to_string(),
+            "0xroot".to_string(),
+            vec!["reth-zisk".to_string(), "reth-zisk".to_string()],
+            0,
+        );
+
+        let error = store
+            .record(duplicate)
+            .await
+            .expect_err("duplicate proof types must fail");
+        assert!(error.to_string().contains("duplicate proof type"));
+        assert!(!store.seen("0xroot").await.expect("check request"));
+
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn persists_and_reloads_across_restart() {
         let dir = temp_state_dir("status-reload");
 
@@ -921,7 +1134,9 @@ mod tests {
             .await
             .expect("create state dir");
         let mut legacy = State::default();
-        legacy.insert(record(205, "0xlegacy"));
+        legacy
+            .insert(record(205, "0xlegacy"))
+            .expect("insert legacy record");
         tokio::fs::write(
             dir.join(sqlite::LEGACY_JSON_FILE),
             serde_json::to_vec_pretty(&legacy).expect("serialize legacy state"),
@@ -1005,7 +1220,9 @@ mod tests {
             .await
             .expect("create state dir");
         let mut legacy = State::default();
-        legacy.insert(record(210, "0xlegacy"));
+        legacy
+            .insert(record(210, "0xlegacy"))
+            .expect("insert legacy record");
         tokio::fs::write(
             dir.join("status.json"),
             serde_json::to_vec_pretty(&legacy).expect("serialize legacy state"),
@@ -1020,7 +1237,9 @@ mod tests {
         // The marker, rather than the presence of request rows, controls the
         // one-time import. Later changes to the retained legacy file are ignored.
         let mut changed_legacy = State::default();
-        changed_legacy.insert(record(211, "0xlate"));
+        changed_legacy
+            .insert(record(211, "0xlate"))
+            .expect("insert changed legacy record");
         tokio::fs::write(
             dir.join("status.json"),
             serde_json::to_vec_pretty(&changed_legacy).expect("serialize changed legacy state"),
@@ -1047,7 +1266,9 @@ mod tests {
         drop(store);
 
         let mut late_legacy = State::default();
-        late_legacy.insert(record(220, "0xlate"));
+        late_legacy
+            .insert(record(220, "0xlate"))
+            .expect("insert late legacy record");
         tokio::fs::write(
             dir.join("status.json"),
             serde_json::to_vec_pretty(&late_legacy).expect("serialize late legacy state"),
@@ -1067,10 +1288,10 @@ mod tests {
         let store = SqliteStatusStore::open(&dir, 2).await.expect("open");
         store.record(record(100, "0xa")).await.expect("record");
         store.record(record(101, "0xb")).await.expect("record");
-        let evicted = store.record(record(102, "0xc")).await.expect("record");
+        let write = store.record(record(102, "0xc")).await.expect("record");
 
         assert_eq!(
-            evicted,
+            write.evicted,
             vec![RetentionEviction {
                 request_root: "0xa".to_string(),
                 slot: 100,
@@ -1118,13 +1339,13 @@ mod tests {
             .await
             .expect("settle request");
 
-        let evicted = store
+        let write = store
             .record(record(102, "0xnew-outstanding"))
             .await
             .expect("record new outstanding request");
 
         assert_eq!(
-            evicted,
+            write.evicted,
             vec![RetentionEviction {
                 request_root: "0xsettled".to_string(),
                 slot: 101,
@@ -1540,14 +1761,15 @@ mod tests {
                 .record(record(100, "0xa"))
                 .await
                 .expect("record")
+                .evicted
                 .is_empty()
         );
 
         // Inserting a newer record over the cap evicts the older one and
         // reports it, so the caller can release its span handle.
-        let evicted = store.record(record(101, "0xb")).await.expect("record");
+        let write = store.record(record(101, "0xb")).await.expect("record");
         assert_eq!(
-            evicted,
+            write.evicted,
             vec![RetentionEviction {
                 request_root: "0xa".to_string(),
                 slot: 100,
@@ -1596,12 +1818,12 @@ mod tests {
             .await
             .expect("settle request");
 
-        let evicted = store
+        let write = store
             .record(record(102, "0xnew-outstanding"))
             .await
             .expect("record new outstanding request");
         assert_eq!(
-            evicted,
+            write.evicted,
             vec![RetentionEviction {
                 request_root: "0xsettled".to_string(),
                 slot: 101,
