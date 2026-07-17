@@ -32,12 +32,12 @@ use crate::metrics::{
     BLOCKS_OBSERVED, BLOCKS_SKIPPED, COMPLETION_DURATION, HEAD_LAG, INFLIGHT_REQUESTS,
     LATE_EVENTS_DISCARDED, LATEST_REQUESTED_SLOT, LATEST_SEEN_SLOT, PROOF_COMPLETIONS,
     PROOF_FAILURES, PROOF_REQUEST_FAILURES, PROOF_REQUESTS, RECONCILE_ACTIONS, REQUEST_DURATION,
-    REQUEST_STAGE_DURATION,
+    REQUEST_STAGE_DURATION, STORE_BYTES, STORE_RECORDS,
 };
 use crate::request;
 use crate::status::{
-    self, BlockRecord, FailureStage, JsonStatusStore, MemoryStatusStore, Outcome, ProofResolution,
-    ResolveOutcome, StatusStore,
+    self, BlockRecord, FailureStage, MemoryStatusStore, Outcome, ProofResolution, ResolveOutcome,
+    RetentionEviction, SqliteStatusStore, StatusStore,
 };
 use crate::zkboost::{self, ProofEvent};
 
@@ -162,6 +162,13 @@ fn ensure_single_proof_type(count: usize) -> Result<()> {
 /// Runs stream mode: request proofs for new non-optimistic beacon blocks.
 pub async fn run(args: StreamArgs) -> Result<()> {
     ensure_single_proof_type(args.proof_types.len())?;
+    // Install the recorder before opening persistent state so startup
+    // retention (including one-time legacy import pruning) is counted too.
+    let metrics_handle = if args.http_addr.is_some() {
+        Some(crate::metrics::install()?)
+    } else {
+        None
+    };
 
     let beacon = Arc::new(beacon::Client::new(
         args.endpoints.beacon_url.clone(),
@@ -202,11 +209,15 @@ pub async fn run(args: StreamArgs) -> Result<()> {
 
     let store: Arc<dyn StatusStore> = match &args.state_dir {
         Some(dir) => {
-            let store = JsonStatusStore::load(dir, args.max_history).await?;
-            let latest_slot = store.latest_slot().await;
+            let store = SqliteStatusStore::open(dir, args.max_history).await?;
+            let latest_slot = store.latest_slot().await?;
+            let storage = store.storage_stats().await?;
             info!(
                 state_dir = %dir.display(),
+                database = %store.path().display(),
                 ?latest_slot,
+                records = storage.map_or(0, |stats| stats.records),
+                bytes = storage.map_or(0, |stats| stats.bytes),
                 "loaded request status from state directory"
             );
             Arc::new(store)
@@ -230,7 +241,7 @@ pub async fn run(args: StreamArgs) -> Result<()> {
 
     let http_server = match args.http_addr {
         Some(addr) => {
-            let handle = crate::metrics::install()?;
+            let handle = metrics_handle.context("metrics recorder was not initialized")?;
             info!(%addr, "serving health, metrics, and the dashboard API");
             Some(tokio::spawn(crate::web::serve(
                 addr,
@@ -244,7 +255,7 @@ pub async fn run(args: StreamArgs) -> Result<()> {
     // Seed the inflight gauge from loaded state now that the recorder exists;
     // starting from the recorder's implicit zero would send the gauge negative
     // as soon as reconciliation resolves proofs recorded by a previous run.
-    sync_inflight_gauge(&store).await;
+    sync_status_gauges(&store).await;
 
     let mut sigterm =
         signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
@@ -457,7 +468,7 @@ async fn submit_block(
     // submit twice. The store keys records by root — the second record
     // replaces the first and events still resolve once — so the cost is a
     // redundant submission to zkBoost, not a corrupt record.
-    if store.seen(&root_hex).await {
+    if store.seen(&root_hex).await? {
         counter!(BLOCKS_SKIPPED).increment(1);
         span.record("outcome", "skipped");
         info!(slot = fetched.slot(), root = %local_root, "request already recorded; skipping");
@@ -556,7 +567,7 @@ async fn submit_block(
             return Err(error);
         }
     }
-    sync_inflight_gauge(store).await;
+    sync_status_gauges(store).await;
 
     info!(
         slot = fetched.slot(),
@@ -617,13 +628,13 @@ fn drop_span(spans: &SpanRegistry, root_hex: &str) {
 /// would stay open (and leak) until shutdown. Resolved records were already
 /// removed from the registry on their terminal transition, so most evictions
 /// are no-ops here.
-fn close_evicted_spans(spans: &SpanRegistry, evicted: &[String]) {
+fn close_evicted_spans(spans: &SpanRegistry, evicted: &[RetentionEviction]) {
     if evicted.is_empty() {
         return;
     }
     if let Ok(mut map) = spans.lock() {
-        for root in evicted {
-            if let Some(span) = map.remove(root) {
+        for eviction in evicted {
+            if let Some(span) = map.remove(&eviction.request_root) {
                 span.record("outcome", "evicted");
             }
         }
@@ -641,8 +652,19 @@ fn close_evicted_spans(spans: &SpanRegistry, evicted: &[String]) {
 /// and briefly publish the staler count. Accepted — the very next sync
 /// self-corrects, since every value is recomputed from store state rather
 /// than accumulated.
-async fn sync_inflight_gauge(store: &Arc<dyn StatusStore>) {
-    gauge!(INFLIGHT_REQUESTS).set(store.inflight_proofs().await as f64);
+async fn sync_status_gauges(store: &Arc<dyn StatusStore>) {
+    match store.inflight_proofs().await {
+        Ok(count) => gauge!(INFLIGHT_REQUESTS).set(count as f64),
+        Err(error) => warn!(%error, "failed to refresh inflight gauge from status store"),
+    }
+    match store.storage_stats().await {
+        Ok(Some(stats)) => {
+            gauge!(STORE_RECORDS).set(stats.records as f64);
+            gauge!(STORE_BYTES).set(stats.bytes as f64);
+        }
+        Ok(None) => {}
+        Err(error) => warn!(%error, "failed to refresh status-store size gauges"),
+    }
 }
 
 /// On a block's terminal transition, records the derived outcome on its root
@@ -921,7 +943,7 @@ async fn record_completion(
         };
         finish_block_span(&spans, &root_hex, &resolution);
         counter!(PROOF_COMPLETIONS, "proof_type" => proof_type.clone()).increment(1);
-        sync_inflight_gauge(&store).await;
+        sync_status_gauges(&store).await;
         histogram!(COMPLETION_DURATION, "proof_type" => proof_type)
             .record(resolution.duration_ms as f64 / 1000.0);
         Ok(Some(resolution))
@@ -963,7 +985,7 @@ async fn record_failure(
         };
         finish_block_span(&spans, &root_hex, &resolution);
         counter!(PROOF_FAILURES, "proof_type" => proof_type, "reason" => reason).increment(1);
-        sync_inflight_gauge(&store).await;
+        sync_status_gauges(&store).await;
         Ok(Some(resolution))
     })
     .await
@@ -1025,7 +1047,13 @@ async fn reconcile(
     unresolved_after: Duration,
     liveness: &LivenessAnchor,
 ) {
-    let stuck = store.unresolved_records().await;
+    let stuck = match store.unresolved_records().await {
+        Ok(records) => records,
+        Err(error) => {
+            warn!(%error, "failed to load unresolved records for reconciliation");
+            return;
+        }
+    };
     // Age floor: only probe records that have waited at least a quarter of
     // the verdict cutoff. A seconds-old record cannot face the silence policy
     // for a long time, so probing it every sweep would only churn one
@@ -1440,6 +1468,7 @@ mod tests {
         store
             .records()
             .await
+            .expect("read records")
             .into_iter()
             .next()
             .expect("one record")
@@ -1565,11 +1594,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StatusStore for FailingStore {
-        async fn seen(&self, _root: &str) -> bool {
-            false
+        async fn seen(&self, _root: &str) -> Result<bool> {
+            Ok(false)
         }
 
-        async fn record(&self, _record: BlockRecord) -> Result<Vec<String>> {
+        async fn record(&self, _record: BlockRecord) -> Result<Vec<RetentionEviction>> {
             anyhow::bail!("store write failed")
         }
 
@@ -1583,20 +1612,37 @@ mod tests {
             anyhow::bail!("store write failed")
         }
 
-        async fn latest_slot(&self) -> Option<u64> {
-            None
+        async fn latest_slot(&self) -> Result<Option<u64>> {
+            Ok(None)
         }
 
-        async fn inflight_proofs(&self) -> usize {
-            0
+        async fn inflight_proofs(&self) -> Result<usize> {
+            Ok(0)
         }
 
-        async fn unresolved_records(&self) -> Vec<BlockRecord> {
-            Vec::new()
+        async fn unresolved_records(&self) -> Result<Vec<BlockRecord>> {
+            Ok(Vec::new())
         }
 
-        async fn records(&self) -> Vec<BlockRecord> {
-            Vec::new()
+        async fn records(&self) -> Result<Vec<BlockRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn records_page(
+            &self,
+            _cursor: Option<&status::RecordCursor>,
+            _filter: status::RecordFilter,
+            _limit: usize,
+        ) -> Result<status::RecordPage> {
+            anyhow::bail!("store read failed")
+        }
+
+        async fn summary(&self) -> Result<status::StatusSummary> {
+            anyhow::bail!("store read failed")
+        }
+
+        async fn storage_stats(&self) -> Result<Option<status::StorageStats>> {
+            anyhow::bail!("store read failed")
         }
     }
 
@@ -1866,7 +1912,13 @@ mod tests {
 
         // Terminal: later sweeps find nothing unresolved, so the record is
         // never revisited (no warn-spam, no re-judging).
-        assert!(store.unresolved_records().await.is_empty());
+        assert!(
+            store
+                .unresolved_records()
+                .await
+                .expect("read unresolved records")
+                .is_empty()
+        );
     }
 
     #[test]

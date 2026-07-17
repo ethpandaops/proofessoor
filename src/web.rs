@@ -8,16 +8,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tower_http::services::{ServeDir, ServeFile};
+use tracing::error;
 
-use crate::status::{Outcome, StatusStore};
+use crate::status::{BlockRecord, RecordCursor, RecordFilter, StatusStore, StatusSummary};
+
+const DEFAULT_PAGE_SIZE: usize = 100;
+const MAX_PAGE_SIZE: usize = 250;
 
 /// Shared state for the HTTP handlers.
 #[derive(Clone)]
@@ -63,37 +67,114 @@ async fn render_metrics(State(state): State<AppState>) -> impl IntoResponse {
     state.metrics.render()
 }
 
-/// Returns all recorded block requests (newest slot first).
-async fn blocks(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.store.records().await)
+#[derive(Debug, Deserialize)]
+struct BlocksQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    #[serde(default)]
+    status: RecordFilter,
 }
 
-/// A summary of recorded request outcomes for the dashboard tiles.
 #[derive(Serialize)]
-struct StatusSummary {
-    total: usize,
-    sent: usize,
-    complete: usize,
-    failed: usize,
-    latest_slot: Option<u64>,
+struct BlocksResponse {
+    blocks: Vec<BlockRecord>,
+    next_cursor: Option<String>,
 }
 
-async fn status(State(state): State<AppState>) -> impl IntoResponse {
-    let records = state.store.records().await;
-    let mut summary = StatusSummary {
-        total: records.len(),
-        sent: 0,
-        complete: 0,
-        failed: 0,
-        latest_slot: records.first().map(|record| record.slot),
-    };
-    for record in &records {
-        // Tiles count blocks by their derived (worst-of) outcome, not proofs.
-        match record.outcome() {
-            Outcome::Sent => summary.sent += 1,
-            Outcome::Complete => summary.complete += 1,
-            Outcome::Failed => summary.failed += 1,
-        }
+/// Returns one stable page of recorded block requests, newest slot first.
+async fn blocks(
+    State(state): State<AppState>,
+    Query(query): Query<BlocksQuery>,
+) -> Result<Json<BlocksResponse>, (StatusCode, String)> {
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    if limit == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "limit must be greater than zero".to_string(),
+        ));
     }
-    Json(summary)
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_cursor)
+        .transpose()
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.to_string()))?;
+    let page = state
+        .store
+        .records_page(cursor.as_ref(), query.status, limit.min(MAX_PAGE_SIZE))
+        .await
+        .map_err(|error| {
+            error!(%error, "failed to query dashboard block records");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to query request status".to_string(),
+            )
+        })?;
+    Ok(Json(BlocksResponse {
+        blocks: page.records,
+        next_cursor: page.next_cursor.as_ref().map(encode_cursor),
+    }))
+}
+
+async fn status(State(state): State<AppState>) -> Result<Json<StatusSummary>, StatusCode> {
+    state.store.summary().await.map(Json).map_err(|error| {
+        error!(%error, "failed to query dashboard status summary");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+fn encode_cursor(cursor: &RecordCursor) -> String {
+    format!("v1:{}:{}", cursor.slot, cursor.request_root)
+}
+
+fn decode_cursor(value: &str) -> std::result::Result<RecordCursor, &'static str> {
+    let mut fields = value.splitn(3, ':');
+    let version = fields.next();
+    let slot = fields.next();
+    let request_root = fields.next();
+    let (Some("v1"), Some(slot), Some(request_root)) = (version, slot, request_root) else {
+        return Err("invalid cursor");
+    };
+    if request_root.is_empty() || request_root.contains(':') {
+        return Err("invalid cursor");
+    }
+    let slot: u64 = slot.parse().map_err(|_| "invalid cursor")?;
+    if slot > i64::MAX as u64 {
+        return Err("invalid cursor");
+    }
+    Ok(RecordCursor {
+        slot,
+        request_root: request_root.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_cursor_round_trips() {
+        let cursor = RecordCursor {
+            slot: 123,
+            request_root: "0xabc".to_string(),
+        };
+        assert_eq!(encode_cursor(&cursor), "v1:123:0xabc");
+        assert_eq!(decode_cursor(&encode_cursor(&cursor)), Ok(cursor));
+    }
+
+    #[test]
+    fn dashboard_cursor_rejects_malformed_values() {
+        assert!(decode_cursor("not-a-cursor").is_err());
+        assert!(decode_cursor("abc:0xroot").is_err());
+        assert!(decode_cursor("123:0xroot").is_err());
+        assert!(decode_cursor("v2:123:0xroot").is_err());
+        assert!(decode_cursor("v1:123:").is_err());
+        assert!(decode_cursor("v1:123:0xroot:extra").is_err());
+    }
+
+    #[test]
+    fn dashboard_cursor_rejects_slots_outside_the_storage_range() {
+        assert!(decode_cursor(&format!("v1:{}:0xroot", i64::MAX as u64)).is_ok());
+        assert!(decode_cursor(&format!("v1:{}:0xroot", i64::MAX as u64 + 1)).is_err());
+    }
 }

@@ -48,7 +48,7 @@ pub enum Command {
 /// Arguments for `proofessoor status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
-    /// Directory containing the persisted status (status.json).
+    /// Directory containing the persisted status database.
     #[arg(long)]
     pub state_dir: PathBuf,
 }

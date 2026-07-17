@@ -78,7 +78,7 @@ multiple-versions = "allow"
 
 [sources]
 unknown-registry = "deny"
-# Git crates are allowed only from the orgs we actually depend on — sigp
+# Git crates are allowed only from required upstream organizations — sigp
 # (lighthouse) and eth-act (zkboost and its ere dependency). Any other git
 # source fails the check.
 unknown-git = "deny"

@@ -110,7 +110,8 @@ pub struct Client {
 }
 
 /// Parses "Name: Value" header strings into a [`HeaderMap`], ignoring blank
-/// entries — an unset `PROOFESSOOR_BEACON_HEADER` reaches us as one empty string.
+/// entries. An unset `PROOFESSOOR_BEACON_HEADER` is represented by one empty
+/// string.
 fn build_header_map(headers: &[String]) -> Result<HeaderMap> {
     let mut map = HeaderMap::with_capacity(headers.len());
     for raw in headers {

@@ -1,28 +1,37 @@
 <script lang="ts">
   import type { BlockRecord } from '../lib/types'
+  import type { RequestFilter } from '../lib/api'
   import { e2eMs, failureReason, fmt, outcome, proofTypes, provingMs, shortRoot, splitPct } from '../lib/format'
 
   let {
     blocks,
     paused,
+    filter,
+    page,
+    hasNext,
+    onFilter,
+    onNext,
+    onPrevious,
     onTogglePause,
     onSelect,
   }: {
     blocks: BlockRecord[]
     paused: boolean
+    filter: RequestFilter
+    page: number
+    hasNext: boolean
+    onFilter: (filter: RequestFilter) => void
+    onNext: () => void
+    onPrevious: () => void
     onTogglePause: () => void
     onSelect: (r: BlockRecord) => void
   } = $props()
 
-  type Filter = 'all' | 'sent' | 'failed'
-  let filter = $state<Filter>('all')
-  const chips: [Filter, string][] = [
+  const chips: [RequestFilter, string][] = [
     ['all', 'all'],
     ['sent', 'in-flight'],
     ['failed', 'failed'],
   ]
-
-  const filtered = $derived(blocks.filter((b) => filter === 'all' || outcome(b) === filter))
 </script>
 
 <section class="overflow-hidden rounded-xl border border-line bg-slate/60">
@@ -33,7 +42,7 @@
         {#each chips as [key, label] (key)}
           <button
             type="button"
-            onclick={() => (filter = key)}
+            onclick={() => onFilter(key)}
             class="rounded-md px-2.5 py-1 transition-colors {filter === key
               ? 'bg-violet/20 text-chalk'
               : 'text-chalk/55 hover:text-chalk'}">{label}</button
@@ -50,9 +59,9 @@
     </div>
   </header>
 
-  {#if filtered.length === 0}
+  {#if blocks.length === 0}
     <p class="px-5 py-14 text-center text-sm/6 text-chalk/40">
-      {blocks.length === 0 ? 'Waiting for beacon blocks…' : 'No requests match this filter.'}
+      {filter === 'all' ? 'Waiting for beacon blocks…' : 'No requests match this filter.'}
     </p>
   {:else}
     <div class="overflow-x-auto">
@@ -70,7 +79,7 @@
           </tr>
         </thead>
         <tbody>
-          {#each filtered as r (r.new_payload_request_root)}
+          {#each blocks as r (r.new_payload_request_root)}
             {@const s = splitPct(r)}
             {@const o = outcome(r)}
             <tr
@@ -113,4 +122,21 @@
       </table>
     </div>
   {/if}
+  <footer class="flex items-center justify-end gap-2 border-t border-line px-5 py-3 text-xs/5">
+    <button
+      type="button"
+      disabled={page === 0}
+      onclick={onPrevious}
+      class="rounded-md border border-line px-2.5 py-1 text-chalk/55 transition-colors hover:border-violet disabled:cursor-not-allowed disabled:opacity-30"
+      >Previous</button
+    >
+    <span class="min-w-16 text-center text-chalk/40">Page {page + 1}</span>
+    <button
+      type="button"
+      disabled={!hasNext}
+      onclick={onNext}
+      class="rounded-md border border-line px-2.5 py-1 text-chalk/55 transition-colors hover:border-violet disabled:cursor-not-allowed disabled:opacity-30"
+      >Next</button
+    >
+  </footer>
 </section>

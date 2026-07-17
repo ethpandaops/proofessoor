@@ -3,8 +3,8 @@
 //! The [`StatusStore`] trait is a narrow, swappable interface: stream mode
 //! records each proof request and its outcome, deduplicates already-requested
 //! roots across restarts, and exposes the latest processed slot. The default
-//! [`JsonStatusStore`] keeps the state in memory and snapshots it to a JSON
-//! file; a different backend (SQLite, etc.) can be dropped in behind the trait.
+//! [`SqliteStatusStore`] persists configured state transactionally, while
+//! [`MemoryStatusStore`] keeps request-only runs free of persistence.
 //!
 //! A [`BlockRecord`] holds the block-level facts and one [`ProofRecord`] per
 //! requested proof type; the block outcome is derived, worst-of, across its
@@ -13,13 +13,21 @@
 //! directory when upgrading across that boundary.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use ::metrics::counter;
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tracing::{debug, warn};
+
+use crate::metrics::STORE_EVICTIONS;
+
+mod sqlite;
+
+pub use sqlite::SqliteStatusStore;
 
 /// Outcome of a recorded proof request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,19 +102,18 @@ pub struct ProofRecord {
     #[serde(default)]
     pub resolved_at_ms: Option<u64>,
     /// Time this proof spent queued inside zkBoost before proving started.
-    /// Always `None` today — zkBoost's proof events do not carry queue timing.
-    /// TODO: populate by denormalizing zkBoost's SSE payload once events carry it.
+    /// Current zkBoost proof events do not expose this value. If the event
+    /// schema adds it, event recording must populate this field.
     #[serde(default)]
     pub queue_ms: Option<u64>,
-    /// Pure proving time inside zkBoost, excluding queueing.
-    /// Always `None` today, for the same reason as `queue_ms`.
-    /// TODO: populate by denormalizing zkBoost's SSE payload once events carry it.
+    /// Pure proving time inside zkBoost, excluding queueing. Current zkBoost
+    /// proof events do not expose this value. If the event schema adds it,
+    /// event recording must populate this field.
     #[serde(default)]
     pub prove_ms: Option<u64>,
-    /// 1-based attempt number. Always 1 today: failures are recorded, not
-    /// resubmitted (zkBoost owns proof coordination). This field is where
-    /// per-attempt bookkeeping lives once retry of transient submit failures
-    /// is implemented.
+    /// 1-based attempt number. Stream mode records attempt 1 because it does not
+    /// retry submissions. A retry path must increment this value for each
+    /// resubmission while preserving the terminal-outcome invariant.
     #[serde(default = "default_attempt")]
     pub attempt: u32,
 }
@@ -160,9 +167,9 @@ pub struct BlockRecord {
     /// when tracing is enabled and the trace was sampled.
     #[serde(default)]
     pub trace_id: Option<String>,
-    /// Witness-generation time reported by zkBoost. Always `None` today —
-    /// zkBoost's proof events do not carry witness timing.
-    /// TODO: populate by denormalizing zkBoost's SSE payload once events carry it.
+    /// Witness-generation time reported by zkBoost. Current proof events do not
+    /// expose this value. If the event schema adds it, event recording must
+    /// populate this field.
     #[serde(default)]
     pub witness_ms: Option<u64>,
     /// Per-proof-type status, one entry per requested proof type.
@@ -213,8 +220,15 @@ impl BlockRecord {
         outcome
     }
 
-    /// When the request was submitted: the earliest submission across proofs
-    /// (all proofs of a block are submitted in one request today).
+    /// Whether at least one requested proof still needs a terminal outcome.
+    fn has_outstanding_proofs(&self) -> bool {
+        self.proofs
+            .iter()
+            .any(|proof| proof.outcome == Outcome::Sent)
+    }
+
+    /// When the request was submitted: the earliest submission across proofs.
+    /// All proof types for a block are submitted in one request.
     pub fn requested_at_ms(&self) -> Option<u64> {
         self.proofs.iter().map(|p| p.requested_at_ms).min()
     }
@@ -292,6 +306,94 @@ pub enum ResolveOutcome {
     Unknown,
 }
 
+/// Stable boundary for fetching the next page of request records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordCursor {
+    /// Slot of the final record on the previous page.
+    pub slot: u64,
+    /// Request root disambiguating records that share a slot.
+    pub request_root: String,
+}
+
+/// Validated block-outcome filter for dashboard pages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordFilter {
+    #[default]
+    All,
+    Sent,
+    Failed,
+}
+
+impl RecordFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Sent => "sent",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn matches(self, record: &BlockRecord) -> bool {
+        match self {
+            Self::All => true,
+            Self::Sent => record.outcome() == Outcome::Sent,
+            Self::Failed => record.outcome() == Outcome::Failed,
+        }
+    }
+}
+
+/// One bounded page of request records.
+#[derive(Debug, Clone)]
+pub struct RecordPage {
+    /// Records in descending `(slot, request_root)` order.
+    pub records: Vec<BlockRecord>,
+    /// Boundary for the next older page, when more records exist.
+    pub next_cursor: Option<RecordCursor>,
+}
+
+/// Aggregate request outcomes across all retained records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StatusSummary {
+    pub total: usize,
+    pub sent: usize,
+    pub complete: usize,
+    pub failed: usize,
+    pub latest_slot: Option<u64>,
+}
+
+/// Observable size of a persistent status backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStats {
+    pub records: usize,
+    pub bytes: u64,
+}
+
+/// A request removed to enforce the configured retention cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionEviction {
+    /// Protocol identity of the removed request.
+    pub request_root: String,
+    /// Slot used for deterministic oldest-first selection and diagnostics.
+    pub slot: u64,
+    /// Whether removing the request abandoned outstanding work.
+    ///
+    /// This means at least one proof remained `sent`. Any durable post-proof
+    /// workflow must include its pending actions in this classification so
+    /// retention cannot silently abandon them.
+    pub outstanding: bool,
+}
+
+impl RetentionEviction {
+    fn kind(&self) -> &'static str {
+        if self.outstanding {
+            "outstanding"
+        } else {
+            "settled"
+        }
+    }
+}
+
 #[cfg(test)]
 impl ResolveOutcome {
     /// The resolution when a transition actually happened, `None` otherwise.
@@ -309,14 +411,15 @@ impl ResolveOutcome {
 #[async_trait]
 pub trait StatusStore: Send + Sync {
     /// Whether a request for this `new_payload_request_root` is already recorded.
-    async fn seen(&self, root: &str) -> bool;
+    async fn seen(&self, root: &str) -> Result<bool>;
 
     /// Records (or replaces) a request record.
     ///
-    /// Returns the request roots of any records evicted to honor the history
-    /// cap, so the caller can release what it holds per record (open span
-    /// handles) and refresh state-derived gauges.
-    async fn record(&self, record: BlockRecord) -> Result<Vec<String>>;
+    /// Returns records evicted to honor the history cap, so the caller can
+    /// release what it holds per request (open span handles) and refresh
+    /// state-derived gauges. Settled history is selected before outstanding
+    /// work; the cap remains hard if outstanding work alone exceeds it.
+    async fn record(&self, record: BlockRecord) -> Result<Vec<RetentionEviction>>;
 
     /// Resolves one proof of a recorded request to a terminal outcome.
     ///
@@ -333,31 +436,37 @@ pub trait StatusStore: Send + Sync {
     ) -> Result<ResolveOutcome>;
 
     /// The highest slot recorded so far, if any.
-    async fn latest_slot(&self) -> Option<u64>;
+    async fn latest_slot(&self) -> Result<Option<u64>>;
 
     /// Number of proofs currently unresolved (submitted, outcome unknown).
     ///
     /// The inflight gauge is set absolutely from this count rather than
     /// maintained as event deltas, so it survives restarts and history
     /// eviction without drifting.
-    async fn inflight_proofs(&self) -> usize;
+    async fn inflight_proofs(&self) -> Result<usize>;
 
     /// Records with at least one unresolved proof, newest slot first.
     ///
     /// Lives on the trait so the reconciliation sweep never forces a backend
     /// to materialize the whole history just to filter it.
-    async fn unresolved_records(&self) -> Vec<BlockRecord>;
+    async fn unresolved_records(&self) -> Result<Vec<BlockRecord>>;
 
     /// All recorded requests, newest slot first.
-    async fn records(&self) -> Vec<BlockRecord>;
-}
+    async fn records(&self) -> Result<Vec<BlockRecord>>;
 
-/// In-memory status store that snapshots to a JSON file in a state directory.
-#[derive(Debug)]
-pub struct JsonStatusStore {
-    path: PathBuf,
-    max_history: usize,
-    state: Mutex<State>,
+    /// A bounded page of recorded requests, newest first.
+    async fn records_page(
+        &self,
+        cursor: Option<&RecordCursor>,
+        filter: RecordFilter,
+        limit: usize,
+    ) -> Result<RecordPage>;
+
+    /// Aggregate block outcomes across all retained requests.
+    async fn summary(&self) -> Result<StatusSummary>;
+
+    /// Persistent store size, or `None` for the in-memory backend.
+    async fn storage_stats(&self) -> Result<Option<StorageStats>>;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -435,7 +544,7 @@ impl State {
 
     fn snapshot(&self) -> Vec<BlockRecord> {
         let mut records: Vec<BlockRecord> = self.records.values().cloned().collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.slot));
+        sort_records(&mut records);
         records
     }
 
@@ -444,19 +553,17 @@ impl State {
         let mut records: Vec<BlockRecord> = self
             .records
             .values()
-            .filter(|record| record.proofs.iter().any(|p| p.outcome == Outcome::Sent))
+            .filter(|record| record.has_outstanding_proofs())
             .cloned()
             .collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.slot));
+        sort_records(&mut records);
         records
     }
 
-    /// Evicts the lowest-slot records until at most `max_history` remain
-    /// (`max_history` of 0 means unlimited). Returns the request roots of the
-    /// evicted records so callers can release per-record resources — an
-    /// evicted record may still be unresolved, and its inflight-gauge share
-    /// and open span handle must not outlive it.
-    fn prune(&mut self, max_history: usize) -> Vec<String> {
+    /// Evicts settled history first, oldest slot/root first within each class,
+    /// until at most `max_history` records remain (`0` means unlimited).
+    /// Outstanding work is evicted only when it alone exceeds the hard cap.
+    fn prune(&mut self, max_history: usize) -> Vec<RetentionEviction> {
         let mut evicted = Vec::new();
         if max_history == 0 {
             return evicted;
@@ -465,101 +572,28 @@ impl State {
             let oldest = self
                 .records
                 .iter()
-                .min_by_key(|(_, record)| record.slot)
-                .map(|(key, _)| key.clone());
+                .min_by(|(left_root, left), (right_root, right)| {
+                    let left_outstanding = left.has_outstanding_proofs();
+                    let right_outstanding = right.has_outstanding_proofs();
+                    left_outstanding
+                        .cmp(&right_outstanding)
+                        .then_with(|| left.slot.cmp(&right.slot))
+                        .then_with(|| left_root.cmp(right_root))
+                })
+                .map(|(key, record)| RetentionEviction {
+                    request_root: key.clone(),
+                    slot: record.slot,
+                    outstanding: record.has_outstanding_proofs(),
+                });
             match oldest {
-                Some(key) => {
-                    self.records.remove(&key);
-                    evicted.push(key);
+                Some(eviction) => {
+                    self.records.remove(&eviction.request_root);
+                    evicted.push(eviction);
                 }
                 None => break,
             }
         }
         evicted
-    }
-}
-
-impl JsonStatusStore {
-    /// Loads (or initializes) the store from `state_dir/status.json`.
-    pub async fn load(state_dir: &Path, max_history: usize) -> Result<Self> {
-        tokio::fs::create_dir_all(state_dir)
-            .await
-            .with_context(|| format!("failed to create state dir {}", state_dir.display()))?;
-        let path = state_dir.join("status.json");
-
-        let state = match tokio::fs::read(&path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("failed to parse status.json")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
-            Err(error) => {
-                return Err(error).context("failed to read status.json");
-            }
-        };
-
-        Ok(Self {
-            path,
-            max_history,
-            state: Mutex::new(state),
-        })
-    }
-
-    /// Atomically writes the current state to disk (temp file + rename).
-    async fn persist(&self, state: &State) -> Result<()> {
-        let json = serde_json::to_vec_pretty(state).context("failed to serialize status")?;
-        let tmp = self.path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, &json)
-            .await
-            .context("failed to write status snapshot")?;
-        tokio::fs::rename(&tmp, &self.path)
-            .await
-            .context("failed to commit status snapshot")?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl StatusStore for JsonStatusStore {
-    async fn seen(&self, root: &str) -> bool {
-        self.state.lock().await.seen(root)
-    }
-
-    async fn record(&self, record: BlockRecord) -> Result<Vec<String>> {
-        let mut state = self.state.lock().await;
-        state.insert(record);
-        let evicted = state.prune(self.max_history);
-        self.persist(&state).await?;
-        Ok(evicted)
-    }
-
-    async fn resolve_proof(
-        &self,
-        root: &str,
-        proof_type: &str,
-        outcome: Outcome,
-        failure: Option<Failure>,
-    ) -> Result<ResolveOutcome> {
-        let mut state = self.state.lock().await;
-        let resolution = state.resolve_proof(root, proof_type, outcome, failure);
-        // Persist only when something transitioned; no-op events cost no I/O.
-        if matches!(resolution, ResolveOutcome::Transitioned(_)) {
-            self.persist(&state).await?;
-        }
-        Ok(resolution)
-    }
-
-    async fn latest_slot(&self) -> Option<u64> {
-        self.state.lock().await.latest_slot()
-    }
-
-    async fn inflight_proofs(&self) -> usize {
-        self.state.lock().await.inflight_proofs()
-    }
-
-    async fn unresolved_records(&self) -> Vec<BlockRecord> {
-        self.state.lock().await.unresolved()
-    }
-
-    async fn records(&self) -> Vec<BlockRecord> {
-        self.state.lock().await.snapshot()
     }
 }
 
@@ -582,14 +616,18 @@ impl MemoryStatusStore {
 
 #[async_trait]
 impl StatusStore for MemoryStatusStore {
-    async fn seen(&self, root: &str) -> bool {
-        self.state.lock().await.seen(root)
+    async fn seen(&self, root: &str) -> Result<bool> {
+        Ok(self.state.lock().await.seen(root))
     }
 
-    async fn record(&self, record: BlockRecord) -> Result<Vec<String>> {
-        let mut state = self.state.lock().await;
-        state.insert(record);
-        Ok(state.prune(self.max_history))
+    async fn record(&self, record: BlockRecord) -> Result<Vec<RetentionEviction>> {
+        let evicted = {
+            let mut state = self.state.lock().await;
+            state.insert(record);
+            state.prune(self.max_history)
+        };
+        observe_retention_evictions(&evicted);
+        Ok(evicted)
     }
 
     async fn resolve_proof(
@@ -606,20 +644,110 @@ impl StatusStore for MemoryStatusStore {
             .resolve_proof(root, proof_type, outcome, failure))
     }
 
-    async fn latest_slot(&self) -> Option<u64> {
-        self.state.lock().await.latest_slot()
+    async fn latest_slot(&self) -> Result<Option<u64>> {
+        Ok(self.state.lock().await.latest_slot())
     }
 
-    async fn inflight_proofs(&self) -> usize {
-        self.state.lock().await.inflight_proofs()
+    async fn inflight_proofs(&self) -> Result<usize> {
+        Ok(self.state.lock().await.inflight_proofs())
     }
 
-    async fn unresolved_records(&self) -> Vec<BlockRecord> {
-        self.state.lock().await.unresolved()
+    async fn unresolved_records(&self) -> Result<Vec<BlockRecord>> {
+        Ok(self.state.lock().await.unresolved())
     }
 
-    async fn records(&self) -> Vec<BlockRecord> {
-        self.state.lock().await.snapshot()
+    async fn records(&self) -> Result<Vec<BlockRecord>> {
+        Ok(self.state.lock().await.snapshot())
+    }
+
+    async fn records_page(
+        &self,
+        cursor: Option<&RecordCursor>,
+        filter: RecordFilter,
+        limit: usize,
+    ) -> Result<RecordPage> {
+        let mut records = self.state.lock().await.snapshot();
+        records.retain(|record| filter.matches(record));
+        if let Some(cursor) = cursor {
+            records.retain(|record| record_is_before(record, cursor));
+        }
+        Ok(finish_page(records, limit))
+    }
+
+    async fn summary(&self) -> Result<StatusSummary> {
+        let state = self.state.lock().await;
+        let mut summary = StatusSummary {
+            total: state.records.len(),
+            sent: 0,
+            complete: 0,
+            failed: 0,
+            latest_slot: state.latest_slot(),
+        };
+        for record in state.records.values() {
+            match record.outcome() {
+                Outcome::Sent => summary.sent += 1,
+                Outcome::Complete => summary.complete += 1,
+                Outcome::Failed => summary.failed += 1,
+            }
+        }
+        Ok(summary)
+    }
+
+    async fn storage_stats(&self) -> Result<Option<StorageStats>> {
+        Ok(None)
+    }
+}
+
+fn sort_records(records: &mut [BlockRecord]) {
+    records.sort_by(|left, right| {
+        right.slot.cmp(&left.slot).then_with(|| {
+            right
+                .new_payload_request_root
+                .cmp(&left.new_payload_request_root)
+        })
+    });
+}
+
+fn record_is_before(record: &BlockRecord, cursor: &RecordCursor) -> bool {
+    record.slot < cursor.slot
+        || (record.slot == cursor.slot
+            && record.new_payload_request_root.as_str() < cursor.request_root.as_str())
+}
+
+fn finish_page(mut records: Vec<BlockRecord>, limit: usize) -> RecordPage {
+    let has_more = records.len() > limit;
+    records.truncate(limit);
+    let next_cursor = if has_more {
+        records.last().map(|record| RecordCursor {
+            slot: record.slot,
+            request_root: record.new_payload_request_root.clone(),
+        })
+    } else {
+        None
+    };
+    RecordPage {
+        next_cursor,
+        records,
+    }
+}
+
+/// Emits retention observability only after the state change has committed.
+fn observe_retention_evictions(evictions: &[RetentionEviction]) {
+    for eviction in evictions {
+        counter!(STORE_EVICTIONS, "kind" => eviction.kind()).increment(1);
+        if eviction.outstanding {
+            warn!(
+                request_root = %eviction.request_root,
+                slot = eviction.slot,
+                "retention cap evicted outstanding request work"
+            );
+        } else {
+            debug!(
+                request_root = %eviction.request_root,
+                slot = eviction.slot,
+                "retention cap evicted settled request history"
+            );
+        }
     }
 }
 
@@ -631,21 +759,71 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Reads recorded block status from `state_dir/status.json`, sorted by slot.
+/// Reads recorded block status without creating, migrating, or importing state.
+///
+/// An existing SQLite database is opened read-only. If a legacy JSON file is
+/// present before the service performs its one-time import, it is decoded
+/// directly and left untouched. A missing or mistyped state directory fails
+/// loudly instead of being mistaken for empty history.
 pub async fn read_records(state_dir: &Path) -> Result<Vec<BlockRecord>> {
-    let path = state_dir.join("status.json");
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let state: State = serde_json::from_slice(&bytes).context("failed to parse status.json")?;
-    let mut records: Vec<BlockRecord> = state.records.into_values().collect();
-    records.sort_by_key(|record| record.slot);
+    let database_path = state_dir.join(sqlite::DATABASE_FILE);
+    match tokio::fs::metadata(&database_path).await {
+        Ok(metadata) if metadata.is_file() => {
+            let store = SqliteStatusStore::open_read_only(state_dir).await?;
+            let mut records = store.records().await?;
+            records.reverse();
+            Ok(records)
+        }
+        Ok(_) => bail!(
+            "status database path is not a file: {}",
+            database_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            read_legacy_records(state_dir).await
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect {}", database_path.display()))
+        }
+    }
+}
+
+async fn read_legacy_records(state_dir: &Path) -> Result<Vec<BlockRecord>> {
+    let legacy_path = state_dir.join(sqlite::LEGACY_JSON_FILE);
+    let bytes = match tokio::fs::read(&legacy_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "no status database or legacy status file found in {}",
+                state_dir.display()
+            )
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", legacy_path.display()));
+        }
+    };
+    let state: State = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", legacy_path.display()))?;
+    let mut records = state.snapshot();
+    records.reverse();
     Ok(records)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_state_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "proofessoor-{name}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn record(slot: u64, root: &str) -> BlockRecord {
         BlockRecord::new(
@@ -673,41 +851,510 @@ mod tests {
 
     #[tokio::test]
     async fn records_dedup_and_latest_slot() {
-        let dir = std::env::temp_dir().join("proofessoor_status_test_dedup");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let dir = temp_state_dir("status-dedup");
 
-        let store = JsonStatusStore::load(&dir, 0).await.expect("load");
-        assert!(!store.seen("0xa").await);
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        assert!(!store.seen("0xa").await.expect("check root"));
         store.record(record(100, "0xa")).await.expect("record");
         store.record(record(105, "0xb")).await.expect("record");
 
-        assert!(store.seen("0xa").await);
-        assert!(!store.seen("0xc").await);
-        assert_eq!(store.latest_slot().await, Some(105));
+        assert!(store.seen("0xa").await.expect("check root"));
+        assert!(!store.seen("0xc").await.expect("check root"));
+        assert_eq!(store.latest_slot().await.expect("latest slot"), Some(105));
 
+        drop(store);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn persists_and_reloads_across_restart() {
-        let dir = std::env::temp_dir().join("proofessoor_status_test_reload");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let dir = temp_state_dir("status-reload");
 
-        let store = JsonStatusStore::load(&dir, 0).await.expect("load");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
         store.record(record(200, "0xroot")).await.expect("record");
         store
             .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
             .await
             .expect("resolve proof");
+        drop(store);
 
         // Reload as if after a restart.
-        let reloaded = JsonStatusStore::load(&dir, 0).await.expect("reload");
-        assert!(reloaded.seen("0xroot").await);
-        assert_eq!(reloaded.latest_slot().await, Some(200));
-        let records = reloaded.records().await;
+        let reloaded = SqliteStatusStore::open(&dir, 0).await.expect("reload");
+        assert!(reloaded.seen("0xroot").await.expect("check root"));
+        assert_eq!(
+            reloaded.latest_slot().await.expect("latest slot"),
+            Some(200)
+        );
+        let records = reloaded.records().await.expect("read records");
         let reloaded_record = records.first().expect("one record");
         assert_eq!(reloaded_record.outcome(), Outcome::Complete);
 
+        drop(reloaded);
+        let inspected = read_records(&dir).await.expect("inspect read-only status");
+        assert_eq!(inspected.len(), 1);
+        assert_eq!(
+            inspected
+                .first()
+                .expect("one inspected request")
+                .new_payload_request_root,
+            "0xroot"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn status_read_missing_state_fails_without_creating_it() {
+        let dir = temp_state_dir("missing-read-only-status");
+
+        let error = read_records(&dir)
+            .await
+            .expect_err("missing status must fail");
+
+        assert!(error.to_string().contains("no status database"));
+        assert!(!dir.exists(), "status inspection must not create state");
+    }
+
+    #[tokio::test]
+    async fn status_read_legacy_json_does_not_consume_the_import() {
+        let dir = temp_state_dir("read-only-legacy-status");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create state dir");
+        let mut legacy = State::default();
+        legacy.insert(record(205, "0xlegacy"));
+        tokio::fs::write(
+            dir.join(sqlite::LEGACY_JSON_FILE),
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy state"),
+        )
+        .await
+        .expect("write legacy state");
+
+        let inspected = read_records(&dir).await.expect("inspect legacy status");
+        assert_eq!(inspected.len(), 1);
+        assert_eq!(
+            inspected
+                .first()
+                .expect("one inspected legacy request")
+                .new_payload_request_root,
+            "0xlegacy"
+        );
+        assert!(
+            !dir.join(sqlite::DATABASE_FILE).exists(),
+            "status inspection must not create the SQLite database"
+        );
+
+        let store = SqliteStatusStore::open(&dir, 0)
+            .await
+            .expect("service imports legacy state later");
+        assert!(
+            store
+                .seen("0xlegacy")
+                .await
+                .expect("check imported request")
+        );
+
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn status_read_does_not_migrate_an_existing_database() {
+        let dir = temp_state_dir("read-only-unmigrated-status");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create state dir");
+        let path = dir.join(sqlite::DATABASE_FILE);
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let creator = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("create unmigrated database");
+        creator.close().await;
+
+        read_records(&dir)
+            .await
+            .expect_err("unmigrated database must fail inspection");
+
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true);
+        let inspector = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("inspect schema");
+        let migration_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = '_sqlx_migrations'",
+        )
+        .fetch_one(&inspector)
+        .await
+        .expect("inspect migration table");
+        assert_eq!(migration_tables, 0, "status inspection must not migrate");
+        inspector.close().await;
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn imports_legacy_json_once() {
+        let dir = temp_state_dir("legacy-import");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create state dir");
+        let mut legacy = State::default();
+        legacy.insert(record(210, "0xlegacy"));
+        tokio::fs::write(
+            dir.join("status.json"),
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy state"),
+        )
+        .await
+        .expect("write legacy state");
+
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("import");
+        assert!(store.seen("0xlegacy").await.expect("check imported root"));
+        drop(store);
+
+        // The marker, rather than the presence of request rows, controls the
+        // one-time import. Later changes to the retained legacy file are ignored.
+        let mut changed_legacy = State::default();
+        changed_legacy.insert(record(211, "0xlate"));
+        tokio::fs::write(
+            dir.join("status.json"),
+            serde_json::to_vec_pretty(&changed_legacy).expect("serialize changed legacy state"),
+        )
+        .await
+        .expect("rewrite legacy state");
+        let reopened = SqliteStatusStore::open(&dir, 0).await.expect("reopen");
+        assert!(
+            reopened
+                .seen("0xlegacy")
+                .await
+                .expect("check imported root")
+        );
+        assert!(!reopened.seen("0xlate").await.expect("check late root"));
+
+        drop(reopened);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn empty_database_records_the_legacy_import_marker() {
+        let dir = temp_state_dir("empty-import-marker");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        drop(store);
+
+        let mut late_legacy = State::default();
+        late_legacy.insert(record(220, "0xlate"));
+        tokio::fs::write(
+            dir.join("status.json"),
+            serde_json::to_vec_pretty(&late_legacy).expect("serialize late legacy state"),
+        )
+        .await
+        .expect("write late legacy state");
+        let reopened = SqliteStatusStore::open(&dir, 0).await.expect("reopen");
+        assert!(!reopened.seen("0xlate").await.expect("check late root"));
+
+        drop(reopened);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_retention_hard_cap_evicts_oldest_outstanding_request() {
+        let dir = temp_state_dir("sqlite-retention");
+        let store = SqliteStatusStore::open(&dir, 2).await.expect("open");
+        store.record(record(100, "0xa")).await.expect("record");
+        store.record(record(101, "0xb")).await.expect("record");
+        let evicted = store.record(record(102, "0xc")).await.expect("record");
+
+        assert_eq!(
+            evicted,
+            vec![RetentionEviction {
+                request_root: "0xa".to_string(),
+                slot: 100,
+                outstanding: true,
+            }]
+        );
+        assert!(!store.seen("0xa").await.expect("check old root"));
+        assert!(store.seen("0xb").await.expect("check retained root"));
+        assert!(store.seen("0xc").await.expect("check retained root"));
+
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(store.path())
+            .read_only(true);
+        let reader = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open read-only inspection connection");
+        let orphaned_proofs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proofs WHERE request_root = '0xa'")
+                .fetch_one(&reader)
+                .await
+                .expect("count evicted request proofs");
+        assert_eq!(orphaned_proofs, 0, "request pruning must cascade to proofs");
+        reader.close().await;
+
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_retention_prefers_settled_history_over_outstanding_work() {
+        let dir = temp_state_dir("sqlite-settled-first-retention");
+        let store = SqliteStatusStore::open(&dir, 2).await.expect("open");
+        store
+            .record(record(100, "0xold-outstanding"))
+            .await
+            .expect("record old outstanding request");
+        store
+            .record(record(101, "0xsettled"))
+            .await
+            .expect("record settled candidate");
+        store
+            .resolve_proof("0xsettled", "reth-zisk", Outcome::Complete, None)
+            .await
+            .expect("settle request");
+
+        let evicted = store
+            .record(record(102, "0xnew-outstanding"))
+            .await
+            .expect("record new outstanding request");
+
+        assert_eq!(
+            evicted,
+            vec![RetentionEviction {
+                request_root: "0xsettled".to_string(),
+                slot: 101,
+                outstanding: false,
+            }]
+        );
+        assert!(
+            store
+                .seen("0xold-outstanding")
+                .await
+                .expect("check old outstanding request")
+        );
+        assert!(
+            !store
+                .seen("0xsettled")
+                .await
+                .expect("check settled request")
+        );
+        assert!(
+            store
+                .seen("0xnew-outstanding")
+                .await
+                .expect("check new outstanding request")
+        );
+
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_cursor_pages_stay_stable_as_new_slots_arrive() {
+        let dir = temp_state_dir("sqlite-pagination");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        for slot in 101..=105 {
+            store
+                .record(record(slot, format!("0x{slot}").as_str()))
+                .await
+                .expect("record");
+        }
+
+        let first = store
+            .records_page(None, RecordFilter::All, 2)
+            .await
+            .expect("first page");
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|record| record.slot)
+                .collect::<Vec<_>>(),
+            vec![105, 104]
+        );
+        let cursor = first.next_cursor.expect("next cursor");
+
+        // A new head does not shift the boundary for the older second page.
+        store.record(record(106, "0x106")).await.expect("record");
+        let second = store
+            .records_page(Some(&cursor), RecordFilter::All, 2)
+            .await
+            .expect("second page");
+        assert_eq!(
+            second
+                .records
+                .iter()
+                .map(|record| record.slot)
+                .collect::<Vec<_>>(),
+            vec![103, 102]
+        );
+
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_cursor_disambiguates_requests_at_the_same_slot() {
+        let dir = temp_state_dir("sqlite-same-slot-pagination");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        for root in ["0xa", "0xc", "0xb"] {
+            store.record(record(200, root)).await.expect("record");
+        }
+
+        let first = store
+            .records_page(None, RecordFilter::All, 2)
+            .await
+            .expect("first page");
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|record| record.new_payload_request_root.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0xc", "0xb"]
+        );
+        let second = store
+            .records_page(first.next_cursor.as_ref(), RecordFilter::All, 2)
+            .await
+            .expect("second page");
+        assert_eq!(
+            second
+                .records
+                .iter()
+                .map(|record| record.new_payload_request_root.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0xa"]
+        );
+
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_concurrent_terminal_events_preserve_first_terminal_wins() {
+        let dir = temp_state_dir("sqlite-concurrent-resolution");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        store.record(record(250, "0xroot")).await.expect("record");
+
+        let complete = store.resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None);
+        let failed = store.resolve_proof(
+            "0xroot",
+            "reth-zisk",
+            Outcome::Failed,
+            Some(Failure {
+                stage: FailureStage::Proving,
+                reason: "ProvingError".to_string(),
+                error: "proof failed".to_string(),
+            }),
+        );
+        let (complete, failed) = tokio::join!(complete, failed);
+        let outcomes = (
+            complete.expect("complete event"),
+            failed.expect("failure event"),
+        );
+        assert!(
+            matches!(
+                &outcomes,
+                (
+                    ResolveOutcome::Transitioned(_),
+                    ResolveOutcome::AlreadyResolved(Outcome::Complete),
+                ) | (
+                    ResolveOutcome::AlreadyResolved(Outcome::Failed),
+                    ResolveOutcome::Transitioned(_),
+                )
+            ),
+            "unexpected concurrent resolution outcomes: {outcomes:?}"
+        );
+
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_page_limits_requests_not_joined_proof_rows() {
+        let dir = temp_state_dir("sqlite-multi-proof-page");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        store
+            .record(multi_proof_record(301, "0xmulti"))
+            .await
+            .expect("record multi-proof request");
+        store
+            .record(record(300, "0xsingle"))
+            .await
+            .expect("record single-proof request");
+
+        let page = store
+            .records_page(None, RecordFilter::All, 1)
+            .await
+            .expect("page");
+        assert_eq!(page.records.len(), 1);
+        let first = page.records.first().expect("one request");
+        assert_eq!(first.new_payload_request_root, "0xmulti");
+        assert_eq!(first.proofs.len(), 2);
+        assert!(page.next_cursor.is_some());
+
+        let summary = store.summary().await.expect("summary");
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.sent, 2);
+        assert_eq!(summary.complete, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.latest_slot, Some(301));
+
+        store
+            .resolve_proof(
+                "0xsingle",
+                "reth-zisk",
+                Outcome::Failed,
+                Some(Failure {
+                    stage: FailureStage::Proving,
+                    reason: "ProvingError".to_string(),
+                    error: "proof failed".to_string(),
+                }),
+            )
+            .await
+            .expect("resolve failed proof");
+        let failed = store
+            .records_page(None, RecordFilter::Failed, 100)
+            .await
+            .expect("failed page");
+        assert_eq!(failed.records.len(), 1);
+        assert_eq!(
+            failed
+                .records
+                .first()
+                .expect("one failed request")
+                .new_payload_request_root,
+            "0xsingle"
+        );
+        let sent = store
+            .records_page(None, RecordFilter::Sent, 100)
+            .await
+            .expect("sent page");
+        assert_eq!(sent.records.len(), 1);
+        assert_eq!(
+            sent.records
+                .first()
+                .expect("one sent request")
+                .new_payload_request_root,
+            "0xmulti"
+        );
+        let summary = store.summary().await.expect("updated summary");
+        assert_eq!(summary.sent, 1);
+        assert_eq!(summary.failed, 1);
+        let stats = store
+            .storage_stats()
+            .await
+            .expect("storage stats")
+            .expect("persistent store stats");
+        assert_eq!(stats.records, 2);
+        assert!(stats.bytes > 0);
+
+        drop(store);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
@@ -729,7 +1376,7 @@ mod tests {
             .await
             .expect("resolve proof");
 
-        let records = store.records().await;
+        let records = store.records().await.expect("read records");
         let failed = records.first().expect("one record");
         assert_eq!(failed.outcome(), Outcome::Failed);
         assert_eq!(failed.failure_reason(), Some("WitnessTimeout"));
@@ -777,7 +1424,7 @@ mod tests {
         assert_eq!(resolution.block_outcome, Outcome::Failed);
         assert!(resolution.block_resolved);
 
-        let records = store.records().await;
+        let records = store.records().await.expect("read records");
         let block = records.first().expect("one record");
         assert_eq!(block.outcome(), Outcome::Failed);
         assert_eq!(block.failure_reason(), Some("ProvingError"));
@@ -823,7 +1470,7 @@ mod tests {
             ResolveOutcome::AlreadyResolved(Outcome::Complete)
         );
 
-        let records = store.records().await;
+        let records = store.records().await.expect("read records");
         assert_eq!(
             records.first().expect("one record").outcome(),
             Outcome::Complete
@@ -860,7 +1507,13 @@ mod tests {
             ResolveOutcome::AlreadyResolved(Outcome::Failed)
         );
         assert_eq!(
-            store.records().await.first().expect("one record").outcome(),
+            store
+                .records()
+                .await
+                .expect("read records")
+                .first()
+                .expect("one record")
+                .outcome(),
             Outcome::Failed
         );
     }
@@ -873,14 +1526,14 @@ mod tests {
         store.record(record(102, "0xc")).await.expect("record");
 
         // The oldest (slot 100) is evicted; the two newest remain.
-        assert!(!store.seen("0xa").await);
-        assert!(store.seen("0xb").await);
-        assert!(store.seen("0xc").await);
-        assert_eq!(store.latest_slot().await, Some(102));
+        assert!(!store.seen("0xa").await.expect("check root"));
+        assert!(store.seen("0xb").await.expect("check root"));
+        assert!(store.seen("0xc").await.expect("check root"));
+        assert_eq!(store.latest_slot().await.expect("latest slot"), Some(102));
     }
 
     #[tokio::test]
-    async fn record_returns_the_evicted_roots() {
+    async fn record_returns_structured_retention_evictions() {
         let store = MemoryStatusStore::new(1);
         assert!(
             store
@@ -893,32 +1546,99 @@ mod tests {
         // Inserting a newer record over the cap evicts the older one and
         // reports it, so the caller can release its span handle.
         let evicted = store.record(record(101, "0xb")).await.expect("record");
-        assert_eq!(evicted, vec!["0xa".to_string()]);
+        assert_eq!(
+            evicted,
+            vec![RetentionEviction {
+                request_root: "0xa".to_string(),
+                slot: 100,
+                outstanding: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_retention_prefers_settled_history_over_outstanding_work() {
+        let store = MemoryStatusStore::new(2);
+        store
+            .record(multi_proof_record(100, "0xold-outstanding"))
+            .await
+            .expect("record old outstanding request");
+        store
+            .resolve_proof(
+                "0xold-outstanding",
+                "reth-zisk",
+                Outcome::Failed,
+                Some(Failure {
+                    stage: FailureStage::Proving,
+                    reason: "ProvingError".to_string(),
+                    error: "one proof failed while another remains sent".to_string(),
+                }),
+            )
+            .await
+            .expect("partially resolve old outstanding request");
+        assert_eq!(
+            store
+                .records()
+                .await
+                .expect("read partially resolved request")
+                .first()
+                .expect("one request")
+                .outcome(),
+            Outcome::Failed,
+            "worst-of block outcome must not hide its remaining sent proof"
+        );
+        store
+            .record(record(101, "0xsettled"))
+            .await
+            .expect("record settled candidate");
+        store
+            .resolve_proof("0xsettled", "reth-zisk", Outcome::Complete, None)
+            .await
+            .expect("settle request");
+
+        let evicted = store
+            .record(record(102, "0xnew-outstanding"))
+            .await
+            .expect("record new outstanding request");
+        assert_eq!(
+            evicted,
+            vec![RetentionEviction {
+                request_root: "0xsettled".to_string(),
+                slot: 101,
+                outstanding: false,
+            }]
+        );
+        assert!(
+            store
+                .seen("0xold-outstanding")
+                .await
+                .expect("check old outstanding request")
+        );
     }
 
     #[tokio::test]
     async fn inflight_proofs_counts_only_unresolved_proofs() {
         let store = MemoryStatusStore::new(0);
-        assert_eq!(store.inflight_proofs().await, 0);
+        assert_eq!(store.inflight_proofs().await.expect("count inflight"), 0);
 
         store
             .record(multi_proof_record(100, "0xa"))
             .await
             .expect("record");
         store.record(record(101, "0xb")).await.expect("record");
-        assert_eq!(store.inflight_proofs().await, 3);
+        assert_eq!(store.inflight_proofs().await.expect("count inflight"), 3);
 
         store
             .resolve_proof("0xa", "reth-zisk", Outcome::Complete, None)
             .await
             .expect("resolve proof");
-        assert_eq!(store.inflight_proofs().await, 2);
+        assert_eq!(store.inflight_proofs().await.expect("count inflight"), 2);
 
         // Eviction drops the evicted record's unresolved proof from the count.
         let store = MemoryStatusStore::new(1);
         store.record(record(100, "0xa")).await.expect("record");
         store.record(record(101, "0xb")).await.expect("record");
-        assert_eq!(store.inflight_proofs().await, 1);
+        assert_eq!(store.inflight_proofs().await.expect("count inflight"), 1);
     }
 
     #[test]

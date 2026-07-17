@@ -73,9 +73,9 @@ impl ChainConfigSchedule {
 
         // Each BPO blob-schedule entry is its own execution fork. The
         // schedule is reverse-sorted by epoch, so walking it backwards pairs
-        // the earliest change with BPO1. Only BPO1 and BPO2 exist on the wire
-        // today (the spec is removing BPO3-5), so later entries are skipped,
-        // like the reference implementation does.
+        // the earliest change with BPO1. The execution-spec wire enum exposes
+        // only BPO1 and BPO2, so additional schedule entries cannot be
+        // represented and are skipped like the reference implementation does.
         let bpo_entries = config.blob_schedule.as_vec();
         if bpo_entries.len() > 2 {
             tracing::warn!(
