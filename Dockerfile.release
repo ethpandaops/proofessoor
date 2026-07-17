@@ -4,4 +4,7 @@
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY proofessoor /usr/local/bin/proofessoor
 COPY dist /srv/ui
+# SQLite creates the database, WAL, and shared-memory files together here.
+# Seed the mount point with nonroot ownership so a new named volume inherits it.
+COPY --chown=65532:65532 state /state
 ENTRYPOINT ["/usr/local/bin/proofessoor"]

@@ -103,7 +103,7 @@
     <span class="flex items-center gap-1.5"><span class="size-2 rounded-xs bg-gold"></span> in-flight</span>
     <Tooltip
       wide
-      text="A slot with no record. Could be a genuinely missed proposal, an optimistic block we skipped, or a request that never recorded — the cause isn't known from here."
+      text="A slot with no record. Could be a genuinely missed proposal, an optimistic block skipped by proofessoor, or a request that never recorded — the cause isn't known from here."
     >
       <span class="flex cursor-help items-center gap-1.5">
         <span class="size-1 rounded-full bg-line"></span> missed slot

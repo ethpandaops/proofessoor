@@ -22,7 +22,7 @@ pub const PROOF_COMPLETIONS: &str = "proofessoor_proof_completions_total";
 /// Total proofs that failed.
 pub const PROOF_FAILURES: &str = "proofessoor_proof_failures_total";
 /// Total proofs resolved by reconciliation after a watcher reconnect
-/// (labeled by verdict: complete, unresolved).
+/// (labeled by verdict: complete, failed, unresolved).
 pub const RECONCILE_ACTIONS: &str = "proofessoor_reconcile_actions_total";
 /// Total proof events discarded because the proof had already resolved
 /// (labeled by kind: completion, failure). A nonzero rate here means outcomes
@@ -37,6 +37,12 @@ pub const LATEST_REQUESTED_SLOT: &str = "proofessoor_latest_requested_slot";
 pub const LATEST_SEEN_SLOT: &str = "proofessoor_latest_seen_slot";
 /// Slots between the latest seen block and the latest requested one.
 pub const HEAD_LAG: &str = "proofessoor_head_lag_slots";
+/// Number of request records retained by the persistent status backend.
+pub const STORE_RECORDS: &str = "proofessoor_store_records";
+/// Bytes occupied by the persistent status database and its write-ahead log.
+pub const STORE_BYTES: &str = "proofessoor_store_bytes";
+/// Requests removed by the history cap (labeled by kind: settled, outstanding).
+pub const STORE_EVICTIONS: &str = "proofessoor_store_evictions_total";
 /// Time spent fetching, building, and submitting a request.
 pub const REQUEST_DURATION: &str = "proofessoor_proof_request_duration_seconds";
 /// Per-stage time within the request path (labeled by stage: fetch, ssz_decode, build, submit).
@@ -98,6 +104,19 @@ fn register() {
         HEAD_LAG,
         "Slots between the latest seen and requested block"
     );
+    describe_gauge!(
+        STORE_RECORDS,
+        "Request records retained by the status store"
+    );
+    describe_gauge!(
+        STORE_BYTES,
+        Unit::Bytes,
+        "Bytes occupied by the status database and write-ahead log"
+    );
+    describe_counter!(
+        STORE_EVICTIONS,
+        "Requests removed by the configured history cap"
+    );
     describe_histogram!(
         REQUEST_DURATION,
         Unit::Seconds,
@@ -122,4 +141,6 @@ fn register() {
     gauge!(LATEST_REQUESTED_SLOT).set(0.0);
     gauge!(LATEST_SEEN_SLOT).set(0.0);
     gauge!(HEAD_LAG).set(0.0);
+    gauge!(STORE_RECORDS).set(0.0);
+    gauge!(STORE_BYTES).set(0.0);
 }

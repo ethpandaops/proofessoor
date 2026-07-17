@@ -19,9 +19,9 @@ export interface ProofRecord {
   error: string | null
   requested_at_ms: number
   resolved_at_ms: number | null
-  /** Queue time inside zkBoost; not carried by today's proof events. */
+  /** Queue time inside zkBoost; not exposed by current proof events. */
   queue_ms: number | null
-  /** Pure proving time inside zkBoost; not carried by today's proof events. */
+  /** Pure proving time inside zkBoost; not exposed by current proof events. */
   prove_ms: number | null
   /** 1-based attempt number; always 1 until submit retries exist. */
   attempt: number
@@ -42,7 +42,7 @@ export interface BlockRecord {
   observed_at_ms: number
   /** OpenTelemetry trace id, when tracing was enabled and sampled. */
   trace_id: string | null
-  /** Witness-generation time; not carried by today's proof events. */
+  /** Witness-generation time; not exposed by current proof events. */
   witness_ms: number | null
   proofs: ProofRecord[]
 }

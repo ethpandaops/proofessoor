@@ -111,7 +111,13 @@ Follows the Beacon API event stream and requests a proof for each new
 non-optimistic block. Useful flags:
 
 - `--max-inflight N` — cap concurrent submissions (default 1).
-- `--state-dir DIR` — persist status so restarts don't re-request blocks.
+- `--state-dir DIR` — persist status in `proofessoor.sqlite` so restarts don't
+  re-request blocks. An existing v0.3 `status.json` is imported once and left
+  untouched as a backup; subsequent writes go only to SQLite.
+- `--max-history N` — retain at most N request records. The default `0` is
+  unlimited; set a nonzero cap only when the operator wants explicit pruning.
+  The oldest settled records are removed first. If outstanding work alone
+  exceeds the hard cap, its eviction is surfaced in logs and metrics.
 - `--http-addr HOST:PORT` — serve the dashboard, metrics, and health (below).
 - `--ui-dir DIR` — directory of built dashboard assets to serve.
 - `--download` / `--verify` / `--out-dir` — save and/or verify completed proofs.
@@ -135,12 +141,25 @@ non-optimistic block. Useful flags:
 > **Stream proves one proof type at a time.** The status model tracks each
 > proof type separately, but multi-proof streaming is unexercised end to end
 > (dashboard aggregation, per-type failure display) and proving several types
-> per block multiplies prover cost, so stream accepts exactly one
-> `--proof-types` value for now. Use `request` for multiple.
+> per block multiplies prover cost, so stream currently accepts exactly one
+> `--proof-types` value. Use `request` for multiple.
 
 `--http-addr` takes a host and port of your choosing and serves three things on
 that address: the dashboard at `/`, Prometheus metrics at `/metrics`, and a
-health check at `/health`.
+health check at `/health`. The request table uses stable 100-record cursor
+pages, so newly arriving slots do not shift an operator's older page. Outcome
+filters run in SQLite across all retained records rather than only the visible
+page.
+
+The metrics include `proofessoor_store_records`, `proofessoor_store_bytes` (the
+database plus its write-ahead log), and
+`proofessoor_store_evictions_total{kind="settled|outstanding"}` so growth and
+retention remain visible.
+
+The Compose stacks persist the complete `/state` directory in a named volume.
+Do not mount only `proofessoor.sqlite`: SQLite keeps its WAL and shared-memory
+files beside it. A replacement host bind directory must be writable by the
+container's nonroot uid `65532`.
 
 ### Distributed tracing (optional)
 
@@ -163,6 +182,10 @@ proofessoor status --state-dir ./state
 
 Prints each recorded request with its outcome and per-block timing (prep,
 zkBoost, end-to-end) — the same data the dashboard shows, from the terminal.
+This command is inspection-only: it does not create a database, apply
+migrations, or consume the one-time legacy import. Missing or incompatible
+state fails loudly. The stream service owns supported schema upgrades; do not
+wipe the state directory during ordinary upgrades.
 
 ## Run the full stack
 

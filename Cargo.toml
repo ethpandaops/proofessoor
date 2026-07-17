@@ -1,6 +1,6 @@
 [package]
 name = "proofessoor"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT OR Apache-2.0"
@@ -42,6 +42,7 @@ reqwest-eventsource = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"

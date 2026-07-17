@@ -210,7 +210,7 @@ async fn run_status(args: StatusArgs) -> Result<()> {
         let fmt_ms =
             |value: Option<u64>| value.map_or_else(|| "-".to_string(), |ms| format!("{ms}ms"));
         // Only the short reason category goes inline; the free-form error text
-        // would blow out the column layout and stays in the API and status.json.
+        // would blow out the column layout and stays in the API and status database.
         // The line shows the block's derived (worst-of) outcome and the first
         // failed proof's reason; per-proof detail lives in the API.
         let failure = record
