@@ -12,6 +12,7 @@
 //! flat, single-outcome record shape and are not readable — delete the state
 //! directory when upgrading across that boundary.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -309,10 +310,26 @@ pub enum ResolveOutcome {
 /// Stable boundary for fetching the next page of request records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordCursor {
+    /// Sort used to create this boundary.
+    pub sort: RecordSort,
+    /// Sort direction used to create this boundary.
+    pub order: SortOrder,
+    /// Value of the selected sort field, or `None` for unresolved durations.
+    pub sort_value: Option<u64>,
     /// Slot of the final record on the previous page.
     pub slot: u64,
     /// Request root disambiguating records that share a slot.
     pub request_root: String,
+}
+
+impl RecordCursor {
+    pub(crate) fn is_valid_for(&self, query: &RecordQuery) -> bool {
+        let requires_value = matches!(self.sort, RecordSort::Slot | RecordSort::PrepMs);
+        self.sort == query.sort
+            && self.order == query.order
+            && (!requires_value || self.sort_value.is_some())
+            && (self.sort != RecordSort::Slot || self.sort_value == Some(self.slot))
+    }
 }
 
 /// Validated block-outcome filter for dashboard pages.
@@ -322,23 +339,157 @@ pub enum RecordFilter {
     #[default]
     All,
     Sent,
+    Complete,
     Failed,
 }
 
 impl RecordFilter {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Sent => "sent",
-            Self::Failed => "failed",
-        }
-    }
-
     fn matches(self, record: &BlockRecord) -> bool {
         match self {
             Self::All => true,
             Self::Sent => record.outcome() == Outcome::Sent,
+            Self::Complete => record.outcome() == Outcome::Complete,
             Self::Failed => record.outcome() == Outcome::Failed,
+        }
+    }
+}
+
+/// Allowlisted field used to order dashboard request pages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordSort {
+    #[default]
+    Slot,
+    PrepMs,
+    ProvingMs,
+    TotalMs,
+}
+
+impl RecordSort {
+    /// Stable query/cursor representation of this sort field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Slot => "slot",
+            Self::PrepMs => "prep_ms",
+            Self::ProvingMs => "proving_ms",
+            Self::TotalMs => "total_ms",
+        }
+    }
+
+    /// Parses the representation emitted by [`Self::as_str`].
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "slot" => Some(Self::Slot),
+            "prep_ms" => Some(Self::PrepMs),
+            "proving_ms" => Some(Self::ProvingMs),
+            "total_ms" => Some(Self::TotalMs),
+            _ => None,
+        }
+    }
+
+    fn value(self, record: &BlockRecord) -> Option<u64> {
+        match self {
+            Self::Slot => Some(record.slot),
+            Self::PrepMs => Some(record.prep_ms()),
+            Self::ProvingMs => record.completion_ms(),
+            Self::TotalMs => record.end_to_end_ms(),
+        }
+    }
+}
+
+/// Direction used to order the selected dashboard field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    Asc,
+    #[default]
+    Desc,
+}
+
+/// Exact request identity accepted by the dashboard search box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordSearch {
+    /// Match every request recorded at this beacon slot.
+    Slot(u64),
+    /// Match one exact new-payload request root.
+    RequestRoot(String),
+}
+
+impl SortOrder {
+    /// Stable query/cursor representation of this direction.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    /// Parses the representation emitted by [`Self::as_str`].
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "asc" => Some(Self::Asc),
+            "desc" => Some(Self::Desc),
+            _ => None,
+        }
+    }
+}
+
+/// Validated filters and ordering for one dashboard request page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordQuery {
+    /// Derived block outcome to include.
+    pub outcome: RecordFilter,
+    /// Optional exact slot or request-root search.
+    pub search: Option<RecordSearch>,
+    /// Inclusive minimum discovery-to-submission duration.
+    pub min_prep_ms: Option<u64>,
+    /// Inclusive maximum discovery-to-submission duration.
+    pub max_prep_ms: Option<u64>,
+    /// Inclusive minimum submission-to-resolution duration.
+    pub min_proving_ms: Option<u64>,
+    /// Inclusive maximum submission-to-resolution duration.
+    pub max_proving_ms: Option<u64>,
+    /// Inclusive minimum discovery-to-resolution duration.
+    pub min_total_ms: Option<u64>,
+    /// Inclusive maximum discovery-to-resolution duration.
+    pub max_total_ms: Option<u64>,
+    /// Field used to order matching requests.
+    pub sort: RecordSort,
+    /// Direction used to order the selected field.
+    pub order: SortOrder,
+}
+
+impl RecordQuery {
+    fn requires_proof_aggregation(&self) -> bool {
+        matches!(self.sort, RecordSort::ProvingMs | RecordSort::TotalMs)
+            || self.min_proving_ms.is_some()
+            || self.max_proving_ms.is_some()
+            || self.min_total_ms.is_some()
+            || self.max_total_ms.is_some()
+    }
+
+    fn matches(&self, record: &BlockRecord) -> bool {
+        self.outcome.matches(record)
+            && self.search.as_ref().is_none_or(|search| match search {
+                RecordSearch::Slot(slot) => record.slot == *slot,
+                RecordSearch::RequestRoot(root) => record.new_payload_request_root == *root,
+            })
+            && within_bounds(record.prep_ms(), self.min_prep_ms, self.max_prep_ms)
+            && optional_within_bounds(
+                record.completion_ms(),
+                self.min_proving_ms,
+                self.max_proving_ms,
+            )
+            && optional_within_bounds(record.end_to_end_ms(), self.min_total_ms, self.max_total_ms)
+    }
+
+    fn cursor_for(&self, record: &BlockRecord) -> RecordCursor {
+        RecordCursor {
+            sort: self.sort,
+            order: self.order,
+            sort_value: self.sort.value(record),
+            slot: record.slot,
+            request_root: record.new_payload_request_root.clone(),
         }
     }
 }
@@ -346,7 +497,7 @@ impl RecordFilter {
 /// One bounded page of request records.
 #[derive(Debug, Clone)]
 pub struct RecordPage {
-    /// Records in descending `(slot, request_root)` order.
+    /// Records in the requested stable order.
     pub records: Vec<BlockRecord>,
     /// Boundary for the next older page, when more records exist.
     pub next_cursor: Option<RecordCursor>,
@@ -477,7 +628,7 @@ pub trait StatusStore: Send + Sync {
     async fn records_page(
         &self,
         cursor: Option<&RecordCursor>,
-        filter: RecordFilter,
+        query: &RecordQuery,
         limit: usize,
     ) -> Result<RecordPage>;
 
@@ -709,15 +860,28 @@ impl StatusStore for MemoryStatusStore {
     async fn records_page(
         &self,
         cursor: Option<&RecordCursor>,
-        filter: RecordFilter,
+        query: &RecordQuery,
         limit: usize,
     ) -> Result<RecordPage> {
-        let mut records = self.state.lock().await.snapshot();
-        records.retain(|record| filter.matches(record));
-        if let Some(cursor) = cursor {
-            records.retain(|record| record_is_before(record, cursor));
+        if cursor.is_some_and(|cursor| !cursor.is_valid_for(query)) {
+            bail!("dashboard cursor does not match requested ordering");
         }
-        Ok(finish_page(records, limit))
+        let state = self.state.lock().await;
+        let mut records: Vec<&BlockRecord> = state
+            .records
+            .values()
+            .filter(|record| query.matches(record))
+            .filter(|record| {
+                cursor.is_none_or(|cursor| record_is_after_cursor(record, cursor, query))
+            })
+            .collect();
+        records.sort_by(|left, right| compare_records(left, right, query.sort, query.order));
+        let records = records
+            .into_iter()
+            .take(limit.saturating_add(1))
+            .cloned()
+            .collect();
+        Ok(finish_page(records, limit, query))
     }
 
     async fn summary(&self) -> Result<StatusSummary> {
@@ -785,20 +949,77 @@ fn sort_records(records: &mut [BlockRecord]) {
     });
 }
 
-fn record_is_before(record: &BlockRecord, cursor: &RecordCursor) -> bool {
-    record.slot < cursor.slot
-        || (record.slot == cursor.slot
-            && record.new_payload_request_root.as_str() < cursor.request_root.as_str())
+fn within_bounds(value: u64, min: Option<u64>, max: Option<u64>) -> bool {
+    min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
 }
 
-fn finish_page(mut records: Vec<BlockRecord>, limit: usize) -> RecordPage {
+fn optional_within_bounds(value: Option<u64>, min: Option<u64>, max: Option<u64>) -> bool {
+    match value {
+        Some(value) => within_bounds(value, min, max),
+        None => min.is_none() && max.is_none(),
+    }
+}
+
+fn compare_records(
+    left: &BlockRecord,
+    right: &BlockRecord,
+    sort: RecordSort,
+    order: SortOrder,
+) -> Ordering {
+    compare_record_keys(
+        sort.value(left),
+        left.slot,
+        &left.new_payload_request_root,
+        sort.value(right),
+        right.slot,
+        &right.new_payload_request_root,
+        order,
+    )
+}
+
+fn compare_record_keys(
+    left_value: Option<u64>,
+    left_slot: u64,
+    left_root: &str,
+    right_value: Option<u64>,
+    right_slot: u64,
+    right_root: &str,
+    order: SortOrder,
+) -> Ordering {
+    match (left_value, right_value) {
+        (Some(left), Some(right)) => match order {
+            SortOrder::Asc => left.cmp(&right),
+            SortOrder::Desc => right.cmp(&left),
+        },
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+    .then_with(|| right_slot.cmp(&left_slot))
+    .then_with(|| right_root.cmp(left_root))
+}
+
+fn record_is_after_cursor(
+    record: &BlockRecord,
+    cursor: &RecordCursor,
+    query: &RecordQuery,
+) -> bool {
+    compare_record_keys(
+        query.sort.value(record),
+        record.slot,
+        &record.new_payload_request_root,
+        cursor.sort_value,
+        cursor.slot,
+        &cursor.request_root,
+        query.order,
+    ) == Ordering::Greater
+}
+
+fn finish_page(mut records: Vec<BlockRecord>, limit: usize, query: &RecordQuery) -> RecordPage {
     let has_more = records.len() > limit;
     records.truncate(limit);
     let next_cursor = if has_more {
-        records.last().map(|record| RecordCursor {
-            slot: record.slot,
-            request_root: record.new_payload_request_root.clone(),
-        })
+        records.last().map(|record| query.cursor_for(record))
     } else {
         None
     };
@@ -924,6 +1145,279 @@ mod tests {
             vec!["reth-zisk".to_string(), "ethrex-sp1".to_string()],
             0,
         )
+    }
+
+    fn query(outcome: RecordFilter) -> RecordQuery {
+        RecordQuery {
+            outcome,
+            ..RecordQuery::default()
+        }
+    }
+
+    fn timed_record(
+        slot: u64,
+        root: &str,
+        proof_types: &[&str],
+        observed_at_ms: u64,
+        requested_at_ms: u64,
+        resolutions: &[(Outcome, Option<u64>)],
+    ) -> BlockRecord {
+        assert_eq!(proof_types.len(), resolutions.len());
+        let mut record = BlockRecord::new(
+            slot,
+            "0xbeacon".to_string(),
+            slot - 1,
+            "0xexechash".to_string(),
+            root.to_string(),
+            proof_types
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            observed_at_ms,
+        );
+        for (proof, (outcome, resolved_at_ms)) in
+            record.proofs.iter_mut().zip(resolutions.iter().copied())
+        {
+            proof.requested_at_ms = requested_at_ms;
+            proof.outcome = outcome;
+            proof.resolved_at_ms = resolved_at_ms;
+        }
+        record
+    }
+
+    async fn seed_dashboard_records(store: &dyn StatusStore) {
+        for record in [
+            timed_record(
+                100,
+                "0xa",
+                &["reth-zisk"],
+                1_000,
+                1_100,
+                &[(Outcome::Complete, Some(1_600))],
+            ),
+            timed_record(
+                101,
+                "0xb",
+                &["ethrex-sp1"],
+                2_000,
+                2_200,
+                &[(Outcome::Failed, Some(3_200))],
+            ),
+            timed_record(
+                102,
+                "0xc",
+                &["reth-zisk"],
+                3_000,
+                3_050,
+                &[(Outcome::Sent, None)],
+            ),
+            timed_record(
+                103,
+                "0xd",
+                &["reth-zisk", "ethrex-sp1"],
+                4_000,
+                4_300,
+                &[
+                    (Outcome::Complete, Some(4_600)),
+                    (Outcome::Complete, Some(5_000)),
+                ],
+            ),
+        ] {
+            store.record(record).await.expect("seed dashboard record");
+        }
+    }
+
+    fn roots(page: &RecordPage) -> Vec<&str> {
+        page.records
+            .iter()
+            .map(|record| record.new_payload_request_root.as_str())
+            .collect()
+    }
+
+    async fn assert_dashboard_queries(store: &dyn StatusStore) {
+        seed_dashboard_records(store).await;
+
+        let complete = RecordQuery {
+            outcome: RecordFilter::Complete,
+            ..RecordQuery::default()
+        };
+        assert_eq!(
+            roots(
+                &store
+                    .records_page(None, &complete, 100)
+                    .await
+                    .expect("complete page")
+            ),
+            vec!["0xd", "0xa"]
+        );
+
+        for (outcome, expected) in [
+            (RecordFilter::Failed, vec!["0xb"]),
+            (RecordFilter::Sent, vec!["0xc"]),
+        ] {
+            assert_eq!(
+                roots(
+                    &store
+                        .records_page(None, &query(outcome), 100)
+                        .await
+                        .expect("outcome page")
+                ),
+                expected
+            );
+        }
+
+        let slot_search = RecordQuery {
+            search: Some(RecordSearch::Slot(103)),
+            ..RecordQuery::default()
+        };
+        let page = store
+            .records_page(None, &slot_search, 100)
+            .await
+            .expect("slot search page");
+        assert_eq!(roots(&page), vec!["0xd"]);
+        assert_eq!(
+            page.records
+                .first()
+                .expect("slot search result")
+                .proofs
+                .len(),
+            2
+        );
+
+        let root_search = RecordQuery {
+            search: Some(RecordSearch::RequestRoot("0xb".to_string())),
+            ..RecordQuery::default()
+        };
+        assert_eq!(
+            roots(
+                &store
+                    .records_page(None, &root_search, 100)
+                    .await
+                    .expect("root search page")
+            ),
+            vec!["0xb"]
+        );
+
+        let prep = RecordQuery {
+            min_prep_ms: Some(90),
+            max_prep_ms: Some(250),
+            ..RecordQuery::default()
+        };
+        assert_eq!(
+            roots(
+                &store
+                    .records_page(None, &prep, 100)
+                    .await
+                    .expect("prep page")
+            ),
+            vec!["0xb", "0xa"]
+        );
+
+        let prep_ascending = RecordQuery {
+            sort: RecordSort::PrepMs,
+            order: SortOrder::Asc,
+            ..RecordQuery::default()
+        };
+        let first = store
+            .records_page(None, &prep_ascending, 2)
+            .await
+            .expect("first prep page");
+        assert_eq!(roots(&first), vec!["0xc", "0xa"]);
+        let second = store
+            .records_page(first.next_cursor.as_ref(), &prep_ascending, 2)
+            .await
+            .expect("second prep page");
+        assert_eq!(roots(&second), vec!["0xb", "0xd"]);
+
+        let proving = RecordQuery {
+            min_proving_ms: Some(600),
+            max_proving_ms: Some(800),
+            ..RecordQuery::default()
+        };
+        assert_eq!(
+            roots(
+                &store
+                    .records_page(None, &proving, 100)
+                    .await
+                    .expect("proving page")
+            ),
+            vec!["0xd"]
+        );
+
+        let proving_ascending = RecordQuery {
+            sort: RecordSort::ProvingMs,
+            order: SortOrder::Asc,
+            ..RecordQuery::default()
+        };
+        let first = store
+            .records_page(None, &proving_ascending, 2)
+            .await
+            .expect("first sorted page");
+        assert_eq!(roots(&first), vec!["0xa", "0xd"]);
+        let second = store
+            .records_page(first.next_cursor.as_ref(), &proving_ascending, 2)
+            .await
+            .expect("second sorted page");
+        assert_eq!(roots(&second), vec!["0xb", "0xc"]);
+
+        let total_descending = RecordQuery {
+            sort: RecordSort::TotalMs,
+            order: SortOrder::Desc,
+            ..RecordQuery::default()
+        };
+        assert_eq!(
+            roots(
+                &store
+                    .records_page(None, &total_descending, 100)
+                    .await
+                    .expect("total page")
+            ),
+            vec!["0xb", "0xd", "0xa", "0xc"]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_dashboard_filters_sorts_and_paginates() {
+        assert_dashboard_queries(&MemoryStatusStore::new(0)).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_dashboard_filters_sorts_and_paginates() {
+        let dir = temp_state_dir("sqlite-dashboard-queries");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        assert_dashboard_queries(&store).await;
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn dashboard_only_aggregates_proof_wide_timing_queries() {
+        for query in [
+            RecordQuery::default(),
+            query(RecordFilter::Failed),
+            RecordQuery {
+                search: Some(RecordSearch::Slot(1)),
+                ..RecordQuery::default()
+            },
+            RecordQuery {
+                sort: RecordSort::PrepMs,
+                ..RecordQuery::default()
+            },
+        ] {
+            assert!(!query.requires_proof_aggregation());
+        }
+        for query in [
+            RecordQuery {
+                sort: RecordSort::ProvingMs,
+                ..RecordQuery::default()
+            },
+            RecordQuery {
+                min_total_ms: Some(1),
+                ..RecordQuery::default()
+            },
+        ] {
+            assert!(query.requires_proof_aggregation());
+        }
     }
 
     #[tokio::test]
@@ -1387,7 +1881,7 @@ mod tests {
         }
 
         let first = store
-            .records_page(None, RecordFilter::All, 2)
+            .records_page(None, &query(RecordFilter::All), 2)
             .await
             .expect("first page");
         assert_eq!(
@@ -1403,7 +1897,7 @@ mod tests {
         // A new head does not shift the boundary for the older second page.
         store.record(record(106, "0x106")).await.expect("record");
         let second = store
-            .records_page(Some(&cursor), RecordFilter::All, 2)
+            .records_page(Some(&cursor), &query(RecordFilter::All), 2)
             .await
             .expect("second page");
         assert_eq!(
@@ -1428,7 +1922,7 @@ mod tests {
         }
 
         let first = store
-            .records_page(None, RecordFilter::All, 2)
+            .records_page(None, &query(RecordFilter::All), 2)
             .await
             .expect("first page");
         assert_eq!(
@@ -1440,7 +1934,7 @@ mod tests {
             vec!["0xc", "0xb"]
         );
         let second = store
-            .records_page(first.next_cursor.as_ref(), RecordFilter::All, 2)
+            .records_page(first.next_cursor.as_ref(), &query(RecordFilter::All), 2)
             .await
             .expect("second page");
         assert_eq!(
@@ -1510,7 +2004,7 @@ mod tests {
             .expect("record single-proof request");
 
         let page = store
-            .records_page(None, RecordFilter::All, 1)
+            .records_page(None, &query(RecordFilter::All), 1)
             .await
             .expect("page");
         assert_eq!(page.records.len(), 1);
@@ -1540,7 +2034,7 @@ mod tests {
             .await
             .expect("resolve failed proof");
         let failed = store
-            .records_page(None, RecordFilter::Failed, 100)
+            .records_page(None, &query(RecordFilter::Failed), 100)
             .await
             .expect("failed page");
         assert_eq!(failed.records.len(), 1);
@@ -1553,7 +2047,7 @@ mod tests {
             "0xsingle"
         );
         let sent = store
-            .records_page(None, RecordFilter::Sent, 100)
+            .records_page(None, &query(RecordFilter::Sent), 100)
             .await
             .expect("sent page");
         assert_eq!(sent.records.len(), 1);

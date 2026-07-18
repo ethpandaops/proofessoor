@@ -3,40 +3,100 @@
 
 import type { BlockRecord, StatusSummary } from './types'
 
-export type RequestFilter = 'all' | 'sent' | 'failed'
+export type RequestFilter = 'all' | 'sent' | 'complete' | 'failed'
+export type RequestSort = 'slot' | 'prep_ms' | 'proving_ms' | 'total_ms'
+export type SortOrder = 'asc' | 'desc'
 
-export interface Dashboard {
-  blocks: BlockRecord[]
-  summary: StatusSummary
-  nextCursor: string | null
+export const durationFields = [
+  { label: 'prep', minKey: 'min_prep_ms', maxKey: 'max_prep_ms' },
+  { label: 'proving', minKey: 'min_proving_ms', maxKey: 'max_proving_ms' },
+  { label: 'total', minKey: 'min_total_ms', maxKey: 'max_total_ms' },
+] as const
+
+type DurationField = (typeof durationFields)[number]
+export type DurationKey = DurationField['minKey'] | DurationField['maxKey']
+
+export const durationInputs: { key: DurationKey; label: string }[] = durationFields.flatMap(
+  (field) => [
+    { key: field.minKey, label: `${field.label} min` },
+    { key: field.maxKey, label: `${field.label} max` },
+  ],
+)
+
+export interface RequestQuery {
+  status: RequestFilter
+  search: string
+  min_prep_ms: number | null
+  max_prep_ms: number | null
+  min_proving_ms: number | null
+  max_proving_ms: number | null
+  min_total_ms: number | null
+  max_total_ms: number | null
+  sort: RequestSort
+  order: SortOrder
 }
+
+export const defaultRequestQuery = (): RequestQuery => ({
+  status: 'all',
+  search: '',
+  min_prep_ms: null,
+  max_prep_ms: null,
+  min_proving_ms: null,
+  max_proving_ms: null,
+  min_total_ms: null,
+  max_total_ms: null,
+  sort: 'slot',
+  order: 'desc',
+})
+
+export const isDefaultRequestQuery = (query: RequestQuery): boolean =>
+  JSON.stringify(query) === JSON.stringify(defaultRequestQuery())
 
 export interface BlocksPage {
   blocks: BlockRecord[]
   next_cursor: string | null
 }
 
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 async function json<T>(response: Response): Promise<T> {
-  if (!response.ok) throw new Error(`request failed with HTTP ${response.status}`)
+  if (!response.ok) {
+    const detail = (await response.text()).trim()
+    throw new ApiError(response.status, detail || `request failed with HTTP ${response.status}`)
+  }
   return response.json() as Promise<T>
 }
 
 export async function fetchBlocks(
   cursor: string | null = null,
-  status: RequestFilter = 'all',
+  request: RequestQuery = defaultRequestQuery(),
 ): Promise<BlocksPage> {
-  const query = new URLSearchParams({ limit: '100', status })
+  const query = new URLSearchParams({
+    limit: '100',
+    status: request.status,
+    sort: request.sort,
+    order: request.order,
+  })
+  if (request.search.trim()) query.set('search', request.search.trim())
+  for (const field of durationFields) {
+    for (const key of [field.minKey, field.maxKey]) {
+      const value = request[key]
+      if (value !== null) query.set(key, value.toString())
+    }
+  }
   if (cursor) query.set('cursor', cursor)
   return fetch(`/api/blocks?${query}`).then(json<BlocksPage>)
 }
 
-export async function fetchDashboard(): Promise<Dashboard> {
-  const [blocks, summary] = await Promise.all([
-    fetchBlocks(),
-    fetch('/api/status').then(json<StatusSummary>),
-  ])
-  return { blocks: blocks.blocks, summary, nextCursor: blocks.next_cursor }
-}
+export const fetchStatus = (): Promise<StatusSummary> => fetch('/api/status').then(json<StatusSummary>)
 
 /** A requestor that stops seeing new slots has stalled, not merely answered. */
 const STALE_AFTER_MS = 30_000

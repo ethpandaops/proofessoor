@@ -147,9 +147,11 @@ non-optimistic block. Useful flags:
 `--http-addr` takes a host and port of your choosing and serves three things on
 that address: the dashboard at `/`, Prometheus metrics at `/metrics`, and a
 health check at `/health`. The request table uses stable 100-record cursor
-pages, so newly arriving slots do not shift an operator's older page. Outcome
-filters run in SQLite across all retained records rather than only the visible
-page.
+pages, so newly arriving slots do not shift an operator's older page. Exact
+slot/request-root searches, outcome and duration filters, and timing sorts run
+in SQLite across all retained records rather than only the visible page.
+Unresolved requests sort after resolved durations. Pausing stops automatic
+polling; an explicit search or filter change refreshes the dashboard once.
 
 The metrics include `proofessoor_store_records`, `proofessoor_store_bytes` (the
 database plus its write-ahead log), and
