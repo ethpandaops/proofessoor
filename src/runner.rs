@@ -1640,7 +1640,7 @@ mod tests {
         async fn records_page(
             &self,
             _cursor: Option<&status::RecordCursor>,
-            _filter: status::RecordFilter,
+            _query: &status::RecordQuery,
             _limit: usize,
         ) -> Result<status::RecordPage> {
             anyhow::bail!("store read failed")
