@@ -64,11 +64,20 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
-      # Binary, native (toolchain pinned by rust-toolchain.toml). Default ISA.
+      # Binary, native per arch (toolchain pinned by rust-toolchain.toml).
+      # Built INSIDE rust:bookworm so the binary links against glibc 2.36 —
+      # the same glibc the distroless cc-debian12 runtime ships. Building on
+      # the raw runner (ubuntu-24.04, glibc 2.39) produces GLIBC_2.38+ symbol
+      # requirements that crash at container start ("version 'GLIBC_2.38' not
+      # found"); this mirrors the local Dockerfile's rust:1.93-bookworm stage.
+      # Image pinned by multi-arch manifest digest (resolves per arch).
       # No build cache: this image is published, and restoring a cache is a
       # poisoning vector for release artifacts, so publish builds compile clean.
       - name: Build binary
-        run: cargo build --release --locked --features otel
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 \
+            cargo build --release --locked --features otel
 
       # Stage the prebuilt binary + the shared dashboard into a clean, tiny build
       # context so the stub's COPYs work (the repo .dockerignore excludes both).
