@@ -36,8 +36,10 @@ cp zkboost.toml zkboost.local.toml
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
 ```
 
-Once the image is published, the base file alone (`docker compose up -d`) pulls
-it instead of building (set `PROOFESSOOR_IMAGE` to pin a version).
+The base file alone (`docker compose up -d`) pulls the published
+`ethpandaops/proofessoor` image (set `PROOFESSOOR_IMAGE` to pin a version).
+Adding `-f docker-compose.local.yml` builds proofessoor from this source tree
+instead.
 
 For an authenticated EL, uncomment `[el_headers]` in `zkboost.local.toml` and
 set only the header your provider requires. Keep that ignored file private.

@@ -10,7 +10,18 @@
     type RequestQuery,
     type RequestSort,
   } from '../lib/api'
-  import { e2eMs, failureReason, fmt, outcome, proofTypes, provingMs, shortRoot, splitPct } from '../lib/format'
+  import {
+    e2eMs,
+    failureReason,
+    fmt,
+    outcome,
+    proveMs,
+    proofTypes,
+    queueMs,
+    shortRoot,
+    splitPct,
+    turnaroundMs,
+  } from '../lib/format'
 
   let {
     blocks,
@@ -47,9 +58,9 @@
 
   const sorts: [RequestSort, string][] = [
     ['slot', 'slot'],
-    ['prep_ms', 'prep time'],
-    ['proving_ms', 'proving time'],
-    ['total_ms', 'end-to-end'],
+    ...durationFields.map(
+      (field) => [field.sort, field.sortLabel] satisfies [RequestSort, string],
+    ),
   ]
 
   let durationDraft = $state<Partial<Record<DurationKey, string>>>({})
@@ -213,9 +224,12 @@
             <th class="py-2.5 pr-4 pl-5 font-medium">Slot</th>
             <th class="px-4 py-2.5 font-medium">Exec #</th>
             <th class="px-4 py-2.5 font-medium">Types</th>
-            <th class="px-4 py-2.5 font-medium">Prep ▏ Proving</th>
-            <th class="px-4 py-2.5 text-right font-medium">Proving</th>
+            <th class="px-4 py-2.5 font-medium">Prep ▏ Turnaround</th>
+            <th class="px-4 py-2.5 text-right font-medium">Turnaround</th>
             <th class="px-4 py-2.5 text-right font-medium">End-to-end</th>
+            <th class="hidden px-4 py-2.5 text-right font-medium 2xl:table-cell">Witness</th>
+            <th class="hidden px-4 py-2.5 text-right font-medium xl:table-cell">Queue</th>
+            <th class="hidden px-4 py-2.5 text-right font-medium lg:table-cell">Generation</th>
             <th class="px-4 py-2.5 font-medium">Status</th>
             <th class="py-2.5 pr-5 pl-4 font-medium">Root</th>
           </tr>
@@ -239,13 +253,16 @@
                     <div class="h-full bg-violet" style="width: {s.prep}%"></div>
                     <div
                       class="h-full {o === 'failed' ? 'bg-ember/70' : 'bg-spark'}"
-                      style="width: {s.proving}%"
+                      style="width: {s.turnaround}%"
                     ></div>
                   </div>
                 {/if}
               </td>
-              <td class="px-4 py-2.5 text-right font-medium text-spark/90">{fmt(provingMs(r))}</td>
+              <td class="px-4 py-2.5 text-right font-medium text-spark/90">{fmt(turnaroundMs(r))}</td>
               <td class="px-4 py-2.5 text-right text-chalk/80">{fmt(e2eMs(r))}</td>
+              <td class="hidden px-4 py-2.5 text-right text-chalk/65 2xl:table-cell">{fmt(r.witness_ms)}</td>
+              <td class="hidden px-4 py-2.5 text-right text-chalk/65 xl:table-cell">{fmt(queueMs(r))}</td>
+              <td class="hidden px-4 py-2.5 text-right text-chalk/65 lg:table-cell">{fmt(proveMs(r))}</td>
               <td class="px-4 py-2.5">
                 {#if o === 'complete'}
                   <span class="rounded-md bg-spark/12 px-2 py-0.5 text-xs/5 text-spark">complete</span>

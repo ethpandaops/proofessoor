@@ -155,6 +155,10 @@ pub struct StreamArgs {
     #[arg(long)]
     pub ui_dir: Option<PathBuf>,
 
+    /// Grafana base URL used to link dashboard trace IDs into Tempo Explore.
+    #[arg(long, env = "PROOFESSOOR_GRAFANA_URL")]
+    pub grafana_url: Option<Url>,
+
     /// How long a submitted proof may stay silent before reconciliation marks
     /// it failed with reason "Unresolved". Budget zkBoost's whole pipeline:
     /// witness_timeout + worst-case queue wait + proof_timeout. The queue
@@ -397,5 +401,30 @@ mod tests {
         assert!(ProofTypeName::parse("   ").is_err());
         assert!(ProofTypeName::parse("Reth_Zisk").is_err());
         assert!(ProofTypeName::parse("reth zisk").is_err());
+    }
+
+    #[test]
+    fn stream_accepts_an_optional_grafana_base_url() {
+        let cli = Cli::try_parse_from([
+            "proofessoor",
+            "stream",
+            "--beacon-url",
+            "http://127.0.0.1:5052",
+            "--zkboost-url",
+            "http://127.0.0.1:3000",
+            "--proof-types",
+            "reth-zisk",
+            "--grafana-url",
+            "https://grafana.example/ops/",
+        ])
+        .expect("valid stream config");
+        assert!(matches!(cli.command, Command::Stream(_)));
+        let Command::Stream(args) = cli.command else {
+            return;
+        };
+        assert_eq!(
+            args.grafana_url.map(|url| url.to_string()),
+            Some("https://grafana.example/ops/".to_string())
+        );
     }
 }

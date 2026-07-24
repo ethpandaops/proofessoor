@@ -1,20 +1,41 @@
 // Data layer: fetch the requestor's dashboard state and the pure liveness rule.
 // Reactivity lives in App.svelte; this stays free of runes so it's testable.
 
-import type { BlockRecord, StatusSummary } from './types'
+import type { BlockRecord, DashboardConfig, StatusSummary } from './types'
 
 export type RequestFilter = 'all' | 'sent' | 'complete' | 'failed'
-export type RequestSort = 'slot' | 'prep_ms' | 'proving_ms' | 'total_ms'
 export type SortOrder = 'asc' | 'desc'
 
 export const durationFields = [
-  { label: 'prep', minKey: 'min_prep_ms', maxKey: 'max_prep_ms' },
-  { label: 'proving', minKey: 'min_proving_ms', maxKey: 'max_proving_ms' },
-  { label: 'total', minKey: 'min_total_ms', maxKey: 'max_total_ms' },
+  { label: 'prep', sortLabel: 'prep time', sort: 'prep_ms', minKey: 'min_prep_ms', maxKey: 'max_prep_ms' },
+  {
+    label: 'turnaround',
+    sortLabel: 'zkBoost turnaround',
+    sort: 'proving_ms',
+    minKey: 'min_proving_ms',
+    maxKey: 'max_proving_ms',
+  },
+  { label: 'total', sortLabel: 'end-to-end', sort: 'total_ms', minKey: 'min_total_ms', maxKey: 'max_total_ms' },
+  {
+    label: 'witness',
+    sortLabel: 'witness time',
+    sort: 'witness_ms',
+    minKey: 'min_witness_ms',
+    maxKey: 'max_witness_ms',
+  },
+  { label: 'queue', sortLabel: 'queue wait', sort: 'queue_ms', minKey: 'min_queue_ms', maxKey: 'max_queue_ms' },
+  {
+    label: 'generation',
+    sortLabel: 'proof generation',
+    sort: 'prove_ms',
+    minKey: 'min_prove_ms',
+    maxKey: 'max_prove_ms',
+  },
 ] as const
 
 type DurationField = (typeof durationFields)[number]
 export type DurationKey = DurationField['minKey'] | DurationField['maxKey']
+export type RequestSort = 'slot' | DurationField['sort']
 
 export const durationInputs: { key: DurationKey; label: string }[] = durationFields.flatMap(
   (field) => [
@@ -32,6 +53,12 @@ export interface RequestQuery {
   max_proving_ms: number | null
   min_total_ms: number | null
   max_total_ms: number | null
+  min_witness_ms: number | null
+  max_witness_ms: number | null
+  min_queue_ms: number | null
+  max_queue_ms: number | null
+  min_prove_ms: number | null
+  max_prove_ms: number | null
   sort: RequestSort
   order: SortOrder
 }
@@ -45,6 +72,12 @@ export const defaultRequestQuery = (): RequestQuery => ({
   max_proving_ms: null,
   min_total_ms: null,
   max_total_ms: null,
+  min_witness_ms: null,
+  max_witness_ms: null,
+  min_queue_ms: null,
+  max_queue_ms: null,
+  min_prove_ms: null,
+  max_prove_ms: null,
   sort: 'slot',
   order: 'desc',
 })
@@ -97,6 +130,22 @@ export async function fetchBlocks(
 }
 
 export const fetchStatus = (): Promise<StatusSummary> => fetch('/api/status').then(json<StatusSummary>)
+
+export const fetchDashboardConfig = (): Promise<DashboardConfig> =>
+  fetch('/api/config').then(json<DashboardConfig>)
+
+export function tempoTraceUrl(grafanaUrl: string, traceId: string): string {
+  const base = grafanaUrl.endsWith('/') ? grafanaUrl : `${grafanaUrl}/`
+  const url = new URL('explore', base)
+  url.searchParams.set(
+    'left',
+    JSON.stringify({
+      datasource: 'tempo',
+      queries: [{ refId: 'A', query: traceId, queryType: 'traceql' }],
+    }),
+  )
+  return url.toString()
+}
 
 /** A requestor that stops seeing new slots has stalled, not merely answered. */
 const STALE_AFTER_MS = 30_000

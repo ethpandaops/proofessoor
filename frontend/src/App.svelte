@@ -6,6 +6,7 @@
   import {
     defaultRequestQuery,
     fetchBlocks,
+    fetchDashboardConfig,
     fetchStatus,
     isDefaultRequestQuery,
     isLive,
@@ -27,6 +28,7 @@
   let live = $state(false)
   let paused = $state(false)
   let selected = $state<BlockRecord | null>(null)
+  let grafanaUrl = $state<string | null>(null)
 
   let lastSlot = -1
   let lastAdvanceMs = 0
@@ -118,6 +120,13 @@
   }
 
   $effect(() => {
+    void fetchDashboardConfig()
+      .then((config) => {
+        grafanaUrl = config.grafana_url
+      })
+      .catch(() => {
+        grafanaUrl = null
+      })
     refresh()
     const id = setInterval(refresh, 3000)
     return () => clearInterval(id)
@@ -147,6 +156,6 @@
   </main>
 
   {#if selected}
-    <BlockModal record={selected} onClose={() => (selected = null)} />
+    <BlockModal record={selected} {grafanaUrl} onClose={() => (selected = null)} />
   {/if}
 </div>

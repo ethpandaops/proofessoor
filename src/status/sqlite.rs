@@ -12,8 +12,9 @@ use tracing::info;
 use super::{
     BlockRecord, Failure, FailureStage, Outcome, ProofRecord, ProofResolution, RecordCursor,
     RecordFilter, RecordOutcome, RecordPage, RecordQuery, RecordSearch, RecordWrite,
-    ResolveOutcome, RetentionEviction, SortOrder, State, StatusStore, StatusSummary, StorageStats,
-    finish_page, now_ms, observe_retention_evictions, validate_record,
+    ResolutionSource, ResolveOutcome, RetentionEviction, SortOrder, State, StatusStore,
+    StatusSummary, StorageStats, TerminalMetadata, finish_page, now_ms,
+    observe_retention_evictions, validate_record,
 };
 
 pub(super) const DATABASE_FILE: &str = "proofessoor.sqlite";
@@ -197,6 +198,7 @@ impl SqliteStatusStore {
                 p.resolved_at_ms,
                 p.queue_ms,
                 p.prove_ms,
+                p.resolution_source,
                 p.attempt
             FROM requests AS r
             JOIN proofs AS p ON p.request_root = r.request_root
@@ -221,6 +223,7 @@ impl SqliteStatusStore {
                 p.resolved_at_ms,
                 p.queue_ms,
                 p.prove_ms,
+                p.resolution_source,
                 p.attempt
             FROM requests AS r
             JOIN proofs AS p ON p.request_root = r.request_root
@@ -274,7 +277,11 @@ impl SqliteStatusStore {
         let sort_column = match query.sort {
             super::RecordSort::Slot => "slot",
             super::RecordSort::PrepMs => "prep_ms",
-            super::RecordSort::ProvingMs | super::RecordSort::TotalMs => {
+            super::RecordSort::WitnessMs => "witness_ms",
+            super::RecordSort::ProvingMs
+            | super::RecordSort::TotalMs
+            | super::RecordSort::QueueMs
+            | super::RecordSort::ProveMs => {
                 bail!("proof timing sort reached request-level dashboard query")
             }
         };
@@ -285,7 +292,8 @@ impl SqliteStatusStore {
                 SELECT
                     r.request_root,
                     r.slot,
-                    MAX(r.requested_at_ms - r.observed_at_ms, 0) AS prep_ms
+                    MAX(r.requested_at_ms - r.observed_at_ms, 0) AS prep_ms,
+                    r.witness_ms
                 FROM requests AS r
                 WHERE 1 = 1
             "#,
@@ -297,6 +305,12 @@ impl SqliteStatusStore {
             "MAX(r.requested_at_ms - r.observed_at_ms, 0)",
             query.min_prep_ms,
             query.max_prep_ms,
+        )?;
+        push_duration_bounds(
+            &mut sql,
+            "r.witness_ms",
+            query.min_witness_ms,
+            query.max_witness_ms,
         )?;
         push_page_window(&mut sql, sort_column, query.order, cursor, limit)?;
 
@@ -340,7 +354,18 @@ impl SqliteStatusStore {
                         WHEN COUNT(p.resolved_at_ms) = COUNT(*)
                             THEN MAX(MAX(p.resolved_at_ms) - r.observed_at_ms, 0)
                         ELSE NULL
-                    END AS total_ms
+                    END AS total_ms,
+                    r.witness_ms,
+                    CASE
+                        WHEN COUNT(p.queue_ms) = COUNT(*)
+                            THEN MAX(p.queue_ms)
+                        ELSE NULL
+                    END AS queue_ms,
+                    CASE
+                        WHEN COUNT(p.prove_ms) = COUNT(*)
+                            THEN MAX(p.prove_ms)
+                        ELSE NULL
+                    END AS prove_ms
                 FROM requests AS r
                 JOIN proofs AS p ON p.request_root = r.request_root
                 WHERE 1 = 1
@@ -374,6 +399,24 @@ impl SqliteStatusStore {
             "candidate.total_ms",
             query.min_total_ms,
             query.max_total_ms,
+        )?;
+        push_duration_bounds(
+            &mut sql,
+            "candidate.witness_ms",
+            query.min_witness_ms,
+            query.max_witness_ms,
+        )?;
+        push_duration_bounds(
+            &mut sql,
+            "candidate.queue_ms",
+            query.min_queue_ms,
+            query.max_queue_ms,
+        )?;
+        push_duration_bounds(
+            &mut sql,
+            "candidate.prove_ms",
+            query.min_prove_ms,
+            query.max_prove_ms,
         )?;
         push_page_window(&mut sql, sort_column, query.order, cursor, limit)?;
 
@@ -427,6 +470,7 @@ impl SqliteStatusStore {
                 p.resolved_at_ms,
                 p.queue_ms,
                 p.prove_ms,
+                p.resolution_source,
                 p.attempt
             FROM page
             JOIN requests AS r ON r.request_root = page.request_root
@@ -589,6 +633,7 @@ fn push_page_window(
             p.resolved_at_ms,
             p.queue_ms,
             p.prove_ms,
+            p.resolution_source,
             p.attempt
         FROM page
         JOIN requests AS r ON r.request_root = page.request_root
@@ -723,8 +768,9 @@ async fn insert_record(
                 resolved_at_ms,
                 queue_ms,
                 prove_ms,
+                resolution_source,
                 attempt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(request_root, proof_type) DO NOTHING
             "#,
         )
@@ -753,6 +799,7 @@ async fn insert_record(
                 .map(|value| to_i64(value, "proving duration"))
                 .transpose()?,
         )
+        .bind(proof.resolution_source.map(ResolutionSource::as_str))
         .bind(i64::from(proof.attempt))
         .execute(&mut **transaction)
         .await
@@ -904,6 +951,7 @@ impl StatusStore for SqliteStatusStore {
         proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
+        metadata: TerminalMetadata,
     ) -> Result<ResolveOutcome> {
         match (outcome, failure.as_ref()) {
             (Outcome::Complete, None) | (Outcome::Failed, Some(_)) => {}
@@ -914,6 +962,18 @@ impl StatusStore for SqliteStatusStore {
 
         let now = now_ms();
         let now_i64 = to_i64(now, "resolution timestamp")?;
+        let witness_ms = metadata
+            .witness_ms
+            .map(|value| to_i64(value, "witness duration"))
+            .transpose()?;
+        let queue_ms = metadata
+            .queue_ms
+            .map(|value| to_i64(value, "queue duration"))
+            .transpose()?;
+        let prove_ms = metadata
+            .prove_ms
+            .map(|value| to_i64(value, "proving duration"))
+            .transpose()?;
         let (stage, reason, error) = match failure.as_ref() {
             Some(failure) => (
                 Some(failure_stage_name(failure.stage)),
@@ -939,7 +999,10 @@ impl StatusStore for SqliteStatusStore {
                 failure_stage = ?,
                 failure_reason = ?,
                 failure_error = ?,
-                resolved_at_ms = ?
+                resolved_at_ms = ?,
+                queue_ms = ?,
+                prove_ms = ?,
+                resolution_source = ?
             WHERE request_root = ?
               AND proof_type = ?
               AND outcome = 'sent'
@@ -950,6 +1013,9 @@ impl StatusStore for SqliteStatusStore {
         .bind(reason)
         .bind(error)
         .bind(now_i64)
+        .bind(queue_ms)
+        .bind(prove_ms)
+        .bind(metadata.source.as_str())
         .bind(root)
         .bind(proof_type)
         .execute(&mut *transaction)
@@ -974,6 +1040,15 @@ impl StatusStore for SqliteStatusStore {
                 .transpose()
                 .map(|value| value.unwrap_or(ResolveOutcome::Unknown));
         }
+
+        sqlx::query(
+            "UPDATE requests SET witness_ms = COALESCE(witness_ms, ?) WHERE request_root = ?",
+        )
+        .bind(witness_ms)
+        .bind(root)
+        .execute(&mut *transaction)
+        .await
+        .with_context(|| format!("failed to store witness timing for request {root}"))?;
 
         let row = sqlx::query(
             r#"
@@ -1125,6 +1200,10 @@ fn rows_to_records(rows: Vec<SqliteRow>) -> Result<Vec<BlockRecord>> {
             resolved_at_ms: optional_u64(row.try_get("resolved_at_ms")?, "resolution timestamp")?,
             queue_ms: optional_u64(row.try_get("queue_ms")?, "queue duration")?,
             prove_ms: optional_u64(row.try_get("prove_ms")?, "proving duration")?,
+            resolution_source: row
+                .try_get::<Option<String>, _>("resolution_source")?
+                .map(|value| parse_resolution_source(&value))
+                .transpose()?,
             attempt: u32::try_from(row.try_get::<i64, _>("attempt")?)
                 .context("proof attempt does not fit u32")?,
         };
@@ -1179,6 +1258,14 @@ fn parse_outcome(value: &str) -> Result<Outcome> {
         "complete" => Ok(Outcome::Complete),
         "failed" => Ok(Outcome::Failed),
         _ => bail!("database contains unknown proof outcome {value:?}"),
+    }
+}
+
+fn parse_resolution_source(value: &str) -> Result<ResolutionSource> {
+    match value {
+        "live" => Ok(ResolutionSource::Live),
+        "reconciled" => Ok(ResolutionSource::Reconciled),
+        _ => bail!("database contains unknown resolution source {value:?}"),
     }
 }
 
