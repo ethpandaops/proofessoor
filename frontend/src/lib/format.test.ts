@@ -8,18 +8,20 @@ import {
   failureReason,
   outcome,
   prepMs,
+  proveMs,
   proofDurationMs,
-  provingMs,
-  provingStats,
+  queueMs,
   shortRoot,
   splitPct,
+  turnaroundMs,
+  turnaroundStats,
 } from './format'
 
-// One proof in the given state, submitted at `requested`, resolved +proving.
+// One proof in the given state, submitted at `requested`, resolved +turnaround.
 function proof(
   proofType: string,
   requested: number,
-  proving: number,
+  turnaround: number,
   state: Outcome,
   reason: string | null = null,
 ): ProofRecord {
@@ -30,20 +32,21 @@ function proof(
     reason,
     error: null,
     requested_at_ms: requested,
-    resolved_at_ms: state === 'sent' ? null : requested + proving,
+    resolved_at_ms: state === 'sent' ? null : requested + turnaround,
     queue_ms: null,
     prove_ms: null,
+    resolution_source: null,
     attempt: 1,
   }
 }
 
 // A record observed at `observed` whose proofs were submitted +prep and each
-// resolved +proving (block outcome derives worst-of from the proof states).
+// resolved +turnaround (block outcome derives worst-of from the proof states).
 function block(
   slot: number,
-  opts: { observed?: number; prep?: number; proving?: number; outcome?: Outcome } = {},
+  opts: { observed?: number; prep?: number; turnaround?: number; outcome?: Outcome } = {},
 ): BlockRecord {
-  const { observed = 1000, prep = 500, proving = 1500, outcome = 'complete' } = opts
+  const { observed = 1000, prep = 500, turnaround = 1500, outcome = 'complete' } = opts
   return {
     slot,
     beacon_block_root: '0xbeacon',
@@ -53,7 +56,7 @@ function block(
     observed_at_ms: observed,
     trace_id: null,
     witness_ms: null,
-    proofs: [proof('reth-zisk', observed + prep, proving, outcome)],
+    proofs: [proof('reth-zisk', observed + prep, turnaround, outcome)],
   }
 }
 
@@ -86,45 +89,60 @@ describe('outcome', () => {
   it('resolves block timing only when every proof resolved', () => {
     const half = multi(['complete', 'sent'])
     expect(e2eMs(half)).toBeNull()
-    expect(provingMs(half)).toBeNull()
+    expect(turnaroundMs(half)).toBeNull()
 
     // Fully resolved: the block resolves at the slowest proof (+2500).
     const done = multi(['complete', 'complete'])
-    expect(provingMs(done)).toBe(2500)
+    expect(turnaroundMs(done)).toBe(2500)
     expect(proofDurationMs(done.proofs[0])).toBe(1500)
     expect(proofDurationMs(done.proofs[1])).toBe(2500)
   })
 })
 
 describe('timing', () => {
-  it('derives prep, proving, and end-to-end', () => {
-    const b = block(1, { observed: 1000, prep: 500, proving: 1500 })
+  it('derives prep, turnaround, and end-to-end', () => {
+    const b = block(1, { observed: 1000, prep: 500, turnaround: 1500 })
     expect(prepMs(b)).toBe(500)
-    expect(provingMs(b)).toBe(1500)
+    expect(turnaroundMs(b)).toBe(1500)
     expect(e2eMs(b)).toBe(2000)
   })
 
   it('returns null for unresolved blocks', () => {
     const b = block(1, { outcome: 'sent' })
-    expect(provingMs(b)).toBeNull()
+    expect(turnaroundMs(b)).toBeNull()
     expect(e2eMs(b)).toBeNull()
+  })
+
+  it('derives block stage values only when every proof reports them', () => {
+    const complete = block(1)
+    complete.proofs[0].queue_ms = 400
+    complete.proofs[0].prove_ms = 800
+    expect(queueMs(complete)).toBe(400)
+    expect(proveMs(complete)).toBe(800)
+
+    const partial = {
+      ...complete,
+      proofs: [...complete.proofs, proof('ethrex-sp1', 1500, 2500, 'complete')],
+    }
+    expect(queueMs(partial)).toBeNull()
+    expect(proveMs(partial)).toBeNull()
   })
 })
 
 describe('splitPct', () => {
-  it('prep and proving sum to 100% of end-to-end', () => {
-    const { prep, proving } = splitPct(block(1, { prep: 500, proving: 1500 }))
-    expect(prep + proving).toBeCloseTo(100)
+  it('prep and turnaround sum to 100% of end-to-end', () => {
+    const { prep, turnaround } = splitPct(block(1, { prep: 500, turnaround: 1500 }))
+    expect(prep + turnaround).toBeCloseTo(100)
     expect(prep).toBeCloseTo(25)
-    expect(proving).toBeCloseTo(75)
+    expect(turnaround).toBeCloseTo(75)
   })
 })
 
 describe('e2eDomain', () => {
   it('spans fastest to slowest completed end-to-end', () => {
     const blocks = [
-      block(3, { proving: 500 }), // e2e 1000
-      block(2, { proving: 4500 }), // e2e 5000
+      block(3, { turnaround: 500 }), // e2e 1000
+      block(2, { turnaround: 4500 }), // e2e 5000
       block(1, { outcome: 'sent' }), // ignored
     ]
     expect(e2eDomain(blocks)).toEqual({ min: 1000, max: 5000 })
@@ -139,9 +157,9 @@ describe('barHeight', () => {
   const domain = { min: 1000, max: 5000 }
 
   it('maps domain ends to bar ends and stays monotonic', () => {
-    const lo = barHeight(block(1, { observed: 0, prep: 0, proving: 1000 }), domain)
-    const mid = barHeight(block(2, { observed: 0, prep: 0, proving: 2500 }), domain)
-    const hi = barHeight(block(3, { observed: 0, prep: 0, proving: 5000 }), domain)
+    const lo = barHeight(block(1, { observed: 0, prep: 0, turnaround: 1000 }), domain)
+    const mid = barHeight(block(2, { observed: 0, prep: 0, turnaround: 2500 }), domain)
+    const hi = barHeight(block(3, { observed: 0, prep: 0, turnaround: 5000 }), domain)
     expect(lo).toBe(6)
     expect(hi).toBe(56)
     expect(mid).toBeGreaterThan(lo)
@@ -149,7 +167,7 @@ describe('barHeight', () => {
   })
 
   it('clamps blocks above the domain max (e.g. failures)', () => {
-    expect(barHeight(block(1, { observed: 0, prep: 0, proving: 12000 }), domain)).toBe(56)
+    expect(barHeight(block(1, { observed: 0, prep: 0, turnaround: 12000 }), domain)).toBe(56)
   })
 })
 
@@ -166,12 +184,12 @@ describe('buildCadence', () => {
   })
 })
 
-describe('provingStats', () => {
-  it('reports fastest, slowest, and median proving', () => {
-    const stats = provingStats([
-      block(1, { proving: 3000 }),
-      block(2, { proving: 1000 }),
-      block(3, { proving: 2000 }),
+describe('turnaroundStats', () => {
+  it('reports fastest, slowest, and median turnaround', () => {
+    const stats = turnaroundStats([
+      block(1, { turnaround: 3000 }),
+      block(2, { turnaround: 1000 }),
+      block(3, { turnaround: 2000 }),
     ])!
     expect(stats.fastest.slot).toBe(2)
     expect(stats.slowest.slot).toBe(1)
@@ -179,7 +197,7 @@ describe('provingStats', () => {
   })
 
   it('is null without completed blocks', () => {
-    expect(provingStats([block(1, { outcome: 'sent' })])).toBeNull()
+    expect(turnaroundStats([block(1, { outcome: 'sent' })])).toBeNull()
   })
 })
 

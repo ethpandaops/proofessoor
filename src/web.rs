@@ -31,6 +31,7 @@ const MAX_PAGE_SIZE: usize = 250;
 struct AppState {
     metrics: PrometheusHandle,
     store: Arc<dyn StatusStore>,
+    grafana_url: Option<String>,
 }
 
 /// Serves health, metrics, the dashboard API, and (optionally) the dashboard
@@ -40,13 +41,19 @@ pub async fn serve(
     metrics: PrometheusHandle,
     store: Arc<dyn StatusStore>,
     ui_dir: Option<PathBuf>,
+    grafana_url: Option<String>,
 ) -> Result<()> {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(render_metrics))
         .route("/api/blocks", get(blocks))
         .route("/api/status", get(status))
-        .with_state(AppState { metrics, store });
+        .route("/api/config", get(config))
+        .with_state(AppState {
+            metrics,
+            store,
+            grafana_url,
+        });
 
     // Serve the built dashboard at `/`, falling back to index.html for SPA routes.
     if let Some(dir) = ui_dir {
@@ -83,6 +90,12 @@ struct BlocksQuery {
     max_proving_ms: Option<u64>,
     min_total_ms: Option<u64>,
     max_total_ms: Option<u64>,
+    min_witness_ms: Option<u64>,
+    max_witness_ms: Option<u64>,
+    min_queue_ms: Option<u64>,
+    max_queue_ms: Option<u64>,
+    min_prove_ms: Option<u64>,
+    max_prove_ms: Option<u64>,
     #[serde(default)]
     sort: RecordSort,
     #[serde(default)]
@@ -110,6 +123,9 @@ async fn blocks(
     validate_bounds("prep", query.min_prep_ms, query.max_prep_ms)?;
     validate_bounds("proving", query.min_proving_ms, query.max_proving_ms)?;
     validate_bounds("total", query.min_total_ms, query.max_total_ms)?;
+    validate_bounds("witness", query.min_witness_ms, query.max_witness_ms)?;
+    validate_bounds("queue", query.min_queue_ms, query.max_queue_ms)?;
+    validate_bounds("prove", query.min_prove_ms, query.max_prove_ms)?;
     let record_query = RecordQuery {
         outcome: query.status,
         search: parse_search(query.search.as_deref())?,
@@ -119,6 +135,12 @@ async fn blocks(
         max_proving_ms: query.max_proving_ms,
         min_total_ms: query.min_total_ms,
         max_total_ms: query.max_total_ms,
+        min_witness_ms: query.min_witness_ms,
+        max_witness_ms: query.max_witness_ms,
+        min_queue_ms: query.min_queue_ms,
+        max_queue_ms: query.max_queue_ms,
+        min_prove_ms: query.min_prove_ms,
+        max_prove_ms: query.max_prove_ms,
         sort: query.sort,
         order: query.order,
     };
@@ -158,6 +180,17 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusSummary>, St
     state.store.summary().await.map(Json).map_err(|error| {
         error!(%error, "failed to query dashboard status summary");
         StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[derive(Serialize)]
+struct DashboardConfig {
+    grafana_url: Option<String>,
+}
+
+async fn config(State(state): State<AppState>) -> Json<DashboardConfig> {
+    Json(DashboardConfig {
+        grafana_url: state.grafana_url.clone(),
     })
 }
 
@@ -376,6 +409,9 @@ mod tests {
             RecordSort::PrepMs,
             RecordSort::ProvingMs,
             RecordSort::TotalMs,
+            RecordSort::WitnessMs,
+            RecordSort::QueueMs,
+            RecordSort::ProveMs,
         ] {
             assert_eq!(RecordSort::from_wire(sort.as_str()), Some(sort));
         }

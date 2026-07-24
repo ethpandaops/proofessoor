@@ -1,10 +1,16 @@
 # proofessoor dashboard
 
 The requestor-view dashboard for proofessoor: outcome tiles and a live
-proof-request table with per-block prep and end-to-end timing. Request history
-can be searched by exact slot or request root, filtered by outcome and
-duration, then sorted by slot or timing without loading the full history into
-the browser.
+proof-request table with per-block prep, end-to-end, witness, queue, and proof
+generation timings. The three zkBoost stage columns progressively hide on narrower
+viewports but remain sortable and filterable. Request history can be searched
+by exact slot or request root, filtered by outcome and duration, then sorted by
+slot or timing without loading the full history into the browser.
+
+Block detail shows the complete stage breakdown, each proof's live or
+reconciled resolution source, and its trace ID. Pass `--grafana-url` or
+`PROOFESSOOR_GRAFANA_URL` to turn trace IDs into Tempo Explore links; otherwise
+they remain copyable plain text.
 
 Vite + Svelte 5 + Tailwind v4. Built with [bun](https://bun.sh/); dependency
 versions are pinned exact via `bun.lock`.

@@ -40,7 +40,7 @@ services:
   proofessoor:
     # Published image by default; docker-compose.local.yml swaps this for a
     # from-source build. Pin a version by setting PROOFESSOOR_IMAGE.
-    image: ${PROOFESSOOR_IMAGE:-docker.io/chethack/proofessoor:latest}
+    image: ${PROOFESSOOR_IMAGE:-docker.io/ethpandaops/proofessoor:latest}
     restart: unless-stopped
     environment:
       # proofessoor reads the beacon endpoint from this env var (set it in .env).

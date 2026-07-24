@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'vitest'
-import { ApiError, defaultRequestQuery, fetchBlocks } from './api'
+import { ApiError, defaultRequestQuery, fetchBlocks, tempoTraceUrl } from './api'
 
 const originalFetch = globalThis.fetch
 
@@ -29,6 +29,12 @@ test('fetchBlocks serializes every duration bound including zero', async () => {
     max_proving_ms: 3,
     min_total_ms: 4,
     max_total_ms: 5,
+    min_witness_ms: 6,
+    max_witness_ms: 7,
+    min_queue_ms: 8,
+    max_queue_ms: 9,
+    min_prove_ms: 10,
+    max_prove_ms: 11,
   })
 
   const query = new URL(requested, 'http://localhost').searchParams
@@ -43,6 +49,23 @@ test('fetchBlocks serializes every duration bound including zero', async () => {
     max_proving_ms: '3',
     min_total_ms: '4',
     max_total_ms: '5',
+    min_witness_ms: '6',
+    max_witness_ms: '7',
+    min_queue_ms: '8',
+    max_queue_ms: '9',
+    min_prove_ms: '10',
+    max_prove_ms: '11',
     cursor: 'v2:slot:desc:1:1:0xroot',
+  })
+})
+
+test('tempoTraceUrl preserves the configured Grafana base path', () => {
+  const url = new URL(tempoTraceUrl('https://grafana.example/ops', 'abc123'))
+
+  expect(url.origin).toBe('https://grafana.example')
+  expect(url.pathname).toBe('/ops/explore')
+  expect(JSON.parse(url.searchParams.get('left') ?? '{}')).toEqual({
+    datasource: 'tempo',
+    queries: [{ refId: 'A', query: 'abc123', queryType: 'traceql' }],
   })
 })

@@ -104,7 +104,8 @@ proofessoor stream \
   --proof-types reth-zisk \
   --state-dir ./state \
   --http-addr <host:port> \
-  --ui-dir frontend/dist
+  --ui-dir frontend/dist \
+  --grafana-url <grafana-url>
 ```
 
 Follows the Beacon API event stream and requests a proof for each new
@@ -120,6 +121,9 @@ non-optimistic block. Useful flags:
   exceeds the hard cap, its eviction is surfaced in logs and metrics.
 - `--http-addr HOST:PORT` — serve the dashboard, metrics, and health (below).
 - `--ui-dir DIR` — directory of built dashboard assets to serve.
+- `--grafana-url URL` (`PROOFESSOOR_GRAFANA_URL`) — optional Grafana base URL
+  used to link recorded trace IDs into Tempo Explore. Without it, the dashboard
+  shows a copyable plain trace ID.
 - `--download` / `--verify` / `--out-dir` — save and/or verify completed proofs.
 - `--reconcile-after DURATION` — how long a submitted proof may stay silent
   before reconciliation marks it failed as `Unresolved` (default `900s`;
@@ -150,13 +154,26 @@ health check at `/health`. The request table uses stable 100-record cursor
 pages, so newly arriving slots do not shift an operator's older page. Exact
 slot/request-root searches, outcome and duration filters, and timing sorts run
 in SQLite across all retained records rather than only the visible page.
-Unresolved requests sort after resolved durations. Pausing stops automatic
-polling; an explicit search or filter change refreshes the dashboard once.
+The table distinguishes proofessoor's submit-to-terminal turnaround from
+zkBoost's witness, queue, and proof-generation stage timings. Narrower
+viewports progressively hide the three stage columns, while their filters and
+sorts remain available. The block detail view
+shows every stage, whether the terminal outcome arrived live or through
+reconciliation, and the trace ID. Missing stage data remains unknown (`—`),
+never zero. Unresolved requests sort after resolved durations. Pausing stops
+automatic polling; an explicit search or filter change refreshes the dashboard
+once.
 
 The metrics include `proofessoor_store_records`, `proofessoor_store_bytes` (the
 database plus its write-ahead log), and
 `proofessoor_store_evictions_total{kind="settled|outstanding"}` so growth and
 retention remain visible.
+`proofessoor_request_stage_duration_seconds{stage="fetch|build|submit|verify"}`
+shows proofessoor's request and optional verification work.
+`proofessoor_proof_completion_duration_seconds{proof_type,source}` separates
+live completions from reconciliation discoveries so detection delay can be
+excluded from latency views. Its buckets use 0.5-second steps through the
+12-second slot budget, then 15, 30, 60, 120, 300, and 900 seconds.
 
 The Compose stacks persist the complete `/state` directory in a named volume.
 Do not mount only `proofessoor.sqlite`: SQLite keeps its WAL and shared-memory
@@ -167,11 +184,11 @@ container's nonroot uid `65532`.
 
 Release and Docker images include the optional `otel` support; for a manual
 build, enable it with `cargo build --release --features otel`. Each block gets a
-`prove_block` span covering fetch, build, submit, and the proving wait, closed
-with the block's outcome; the trace id is stored on the block's status record. The
-exporter reads the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable — when
-unset, tracing stays off and behavior is identical to a build without the
-feature. `OTEL_SERVICE_NAME` overrides the default service name
+`prove_block` span covering fetch, build, submit, and the terminal wait, closed
+with the block's terminal outcome; the trace id is stored on the block's status
+record. The exporter reads the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable
+— when unset, tracing stays off and behavior is identical to a build without
+the feature. `OTEL_SERVICE_NAME` overrides the default service name
 `proofessoor`. Outbound zkBoost calls carry the active W3C trace context; a
 zkBoost build with inbound context extraction joins those calls to the same
 distributed trace.

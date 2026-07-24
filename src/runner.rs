@@ -37,7 +37,8 @@ use crate::metrics::{
 use crate::request;
 use crate::status::{
     self, BlockRecord, FailureStage, MemoryStatusStore, Outcome, ProofResolution, RecordOutcome,
-    ResolveOutcome, RetentionEviction, SqliteStatusStore, StatusStore,
+    ResolutionSource, ResolveOutcome, RetentionEviction, SqliteStatusStore, StatusStore,
+    TerminalMetadata,
 };
 use crate::zkboost::{self, ProofEvent};
 
@@ -248,6 +249,7 @@ pub async fn run(args: StreamArgs) -> Result<()> {
                 handle,
                 store.clone(),
                 args.ui_dir.clone(),
+                args.grafana_url.as_ref().map(ToString::to_string),
             )))
         }
         None => None,
@@ -447,10 +449,13 @@ async fn submit_block(
     let start = Instant::now();
     let trace_id = current_trace_id(span);
     let block_id = BlockId::Root(event.block.to_string());
+    let fetch_start = Instant::now();
     let fetched = beacon
         .get_block(&block_id)
         .instrument(info_span!("fetch_block"))
         .await?;
+    histogram!(REQUEST_STAGE_DURATION, "stage" => "fetch")
+        .record(fetch_start.elapsed().as_secs_f64());
 
     let build_start = Instant::now();
     let (payload_request, local_root) = info_span!("build_request").in_scope(|| {
@@ -687,6 +692,10 @@ fn finish_block_span(spans: &SpanRegistry, root_hex: &str, resolution: &ProofRes
     let removed = spans.lock().ok().and_then(|mut map| map.remove(root_hex));
     if let Some(span) = removed {
         span.record("outcome", resolution.block_outcome.as_str());
+        // Re-entering before the final handle drops moves the exported end
+        // time to the terminal transition instead of the earlier submission
+        // exit. The OTel exporter test locks this tracing-layer behavior.
+        span.in_scope(|| {});
     }
 }
 
@@ -866,8 +875,20 @@ async fn handle_proof_event(
     match event {
         ProofEvent::ProofComplete(complete) => {
             let root_hex = complete.new_payload_request_root.to_string();
-            let Some(resolution) =
-                record_completion(store, spans, &root_hex, complete.proof_type.as_str()).await?
+            let metadata = TerminalMetadata {
+                source: ResolutionSource::Live,
+                witness_ms: complete.witness_ms,
+                queue_ms: complete.queue_wait_ms,
+                prove_ms: complete.prove_ms,
+            };
+            let Some(resolution) = record_completion(
+                store,
+                spans,
+                &root_hex,
+                complete.proof_type.as_str(),
+                metadata,
+            )
+            .await?
             else {
                 return Ok(());
             };
@@ -876,7 +897,7 @@ async fn handle_proof_event(
                 // Verification must carry the chain config of the proof's own
                 // block, resolved from its recorded slot.
                 let chain_config = schedule.resolve_slot(resolution.slot);
-                zkboost
+                let verification_duration = zkboost
                     .collect_artifacts(
                         complete.new_payload_request_root,
                         complete.proof_type,
@@ -884,6 +905,10 @@ async fn handle_proof_event(
                         artifacts,
                     )
                     .await?;
+                if let Some(duration) = verification_duration {
+                    histogram!(REQUEST_STAGE_DURATION, "stage" => "verify")
+                        .record(duration.as_secs_f64());
+                }
             }
         }
         ProofEvent::ProofFailure(failure) => {
@@ -894,9 +919,21 @@ async fn handle_proof_event(
                 reason,
                 error: failure.error.clone(),
             };
-            let Some(_resolution) =
-                record_failure(store, spans, &root_hex, failure.proof_type.as_str(), detail)
-                    .await?
+            let metadata = TerminalMetadata {
+                source: ResolutionSource::Live,
+                witness_ms: failure.witness_ms,
+                queue_ms: failure.queue_wait_ms,
+                prove_ms: failure.prove_ms,
+            };
+            let Some(_resolution) = record_failure(
+                store,
+                spans,
+                &root_hex,
+                failure.proof_type.as_str(),
+                detail,
+                metadata,
+            )
+            .await?
             else {
                 return Ok(());
             };
@@ -927,6 +964,7 @@ async fn record_completion(
     spans: &SpanRegistry,
     root_hex: &str,
     proof_type: &str,
+    metadata: TerminalMetadata,
 ) -> Result<Option<ProofResolution>> {
     let store = store.clone();
     let spans = spans.clone();
@@ -934,7 +972,7 @@ async fn record_completion(
     let proof_type = proof_type.to_owned();
     tokio::spawn(async move {
         let resolution = match store
-            .resolve_proof(&root_hex, &proof_type, Outcome::Complete, None)
+            .resolve_proof(&root_hex, &proof_type, Outcome::Complete, None, metadata)
             .await?
         {
             ResolveOutcome::Transitioned(resolution) => resolution,
@@ -953,12 +991,20 @@ async fn record_completion(
         finish_block_span(&spans, &root_hex, &resolution);
         counter!(PROOF_COMPLETIONS, "proof_type" => proof_type.clone()).increment(1);
         sync_status_gauges(&store).await;
-        histogram!(COMPLETION_DURATION, "proof_type" => proof_type)
-            .record(resolution.duration_ms as f64 / 1000.0);
+        observe_completion_duration(&proof_type, metadata.source, resolution.duration_ms);
         Ok(Some(resolution))
     })
     .await
     .context("proof-completion recording task failed")?
+}
+
+fn observe_completion_duration(proof_type: &str, source: ResolutionSource, duration_ms: u64) {
+    histogram!(
+        COMPLETION_DURATION,
+        "proof_type" => proof_type.to_owned(),
+        "source" => source.as_str()
+    )
+    .record(duration_ms as f64 / 1000.0);
 }
 
 /// Resolves one proof to `Failed` in the store, emitting the failure metrics
@@ -974,6 +1020,7 @@ async fn record_failure(
     root_hex: &str,
     proof_type: &str,
     failure: status::Failure,
+    metadata: TerminalMetadata,
 ) -> Result<Option<ProofResolution>> {
     let store = store.clone();
     let spans = spans.clone();
@@ -982,7 +1029,13 @@ async fn record_failure(
     tokio::spawn(async move {
         let reason = failure.reason.clone();
         let resolution = match store
-            .resolve_proof(&root_hex, &proof_type, Outcome::Failed, Some(failure))
+            .resolve_proof(
+                &root_hex,
+                &proof_type,
+                Outcome::Failed,
+                Some(failure),
+                metadata,
+            )
             .await?
         {
             ResolveOutcome::Transitioned(resolution) => resolution,
@@ -1196,6 +1249,7 @@ async fn resolve_unprobeable_record(
             &record.new_payload_request_root,
             &proof.proof_type,
             failure,
+            TerminalMetadata::without_timings(ResolutionSource::Reconciled),
         )
         .await
         {
@@ -1306,7 +1360,13 @@ async fn apply_probe_events(
                 // A replayed completion counts as handled — and leaves
                 // `pending` — only once its store write is confirmed (or the
                 // live stream demonstrably beat this one to it).
-                match record_completion(store, spans, root_hex, proof_type).await {
+                let metadata = TerminalMetadata {
+                    source: ResolutionSource::Reconciled,
+                    witness_ms: complete.witness_ms,
+                    queue_ms: complete.queue_wait_ms,
+                    prove_ms: complete.prove_ms,
+                };
+                match record_completion(store, spans, root_hex, proof_type, metadata).await {
                     Ok(Some(_)) => {
                         pending.remove(proof_type);
                         counter!(RECONCILE_ACTIONS, "verdict" => "complete").increment(1);
@@ -1346,9 +1406,15 @@ async fn apply_probe_events(
         let detail = status::Failure {
             stage: FailureStage::Proving,
             reason: format!("{:?}", failure.reason),
-            error: failure.error,
+            error: failure.error.clone(),
         };
-        match record_failure(store, spans, root_hex, &proof_type, detail).await {
+        let metadata = TerminalMetadata {
+            source: ResolutionSource::Reconciled,
+            witness_ms: failure.witness_ms,
+            queue_ms: failure.queue_wait_ms,
+            prove_ms: failure.prove_ms,
+        };
+        match record_failure(store, spans, root_hex, &proof_type, detail, metadata).await {
             Ok(Some(_)) => {
                 pending.remove(&proof_type);
                 counter!(RECONCILE_ACTIONS, "verdict" => "failed").increment(1);
@@ -1423,6 +1489,7 @@ async fn resolve_silent_proofs(
             &record.new_payload_request_root,
             &proof.proof_type,
             failure,
+            TerminalMetadata::without_timings(ResolutionSource::Reconciled),
         )
         .await?
         .is_some()
@@ -1489,7 +1556,24 @@ mod tests {
             proof_type: zkboost::parse_proof_type("reth-zisk").expect("valid proof type"),
             reason: FailureReason::ProvingError,
             error: error.to_owned(),
+            witness_ms: Some(12_000),
+            queue_wait_ms: None,
+            prove_ms: None,
         })
+    }
+
+    fn proof_complete(root: Hash256) -> ProofEvent {
+        ProofEvent::ProofComplete(ProofComplete {
+            new_payload_request_root: root,
+            proof_type: zkboost::parse_proof_type("reth-zisk").expect("valid proof type"),
+            witness_ms: None,
+            queue_wait_ms: None,
+            prove_ms: None,
+        })
+    }
+
+    const fn live_metadata() -> TerminalMetadata {
+        TerminalMetadata::without_timings(ResolutionSource::Live)
     }
 
     #[tokio::test]
@@ -1617,6 +1701,7 @@ mod tests {
             _proof_type: &str,
             _outcome: Outcome,
             _failure: Option<status::Failure>,
+            _metadata: TerminalMetadata,
         ) -> Result<ResolveOutcome> {
             anyhow::bail!("store write failed")
         }
@@ -1663,10 +1748,7 @@ mod tests {
         // The replayed completion proves the proof finished; failing to
         // record it must not leave the proof exposed to the silence policy.
         let root: Hash256 = record.new_payload_request_root.parse().expect("valid root");
-        let replay = futures::stream::iter(vec![Ok(ProofEvent::ProofComplete(ProofComplete {
-            new_payload_request_root: root,
-            proof_type: zkboost::parse_proof_type("reth-zisk").expect("valid proof type"),
-        }))]);
+        let replay = futures::stream::iter(vec![Ok(proof_complete(root))]);
         let pending: HashSet<String> = ["reth-zisk".to_string()].into();
         let judgeable = apply_probe_events(
             &store,
@@ -1688,10 +1770,7 @@ mod tests {
         store.record(record.clone()).await.expect("record");
 
         let root: Hash256 = record.new_payload_request_root.parse().expect("valid root");
-        let replay = futures::stream::iter(vec![Ok(ProofEvent::ProofComplete(ProofComplete {
-            new_payload_request_root: root,
-            proof_type: zkboost::parse_proof_type("reth-zisk").expect("valid proof type"),
-        }))]);
+        let replay = futures::stream::iter(vec![Ok(proof_complete(root))]);
         let pending: HashSet<String> = ["reth-zisk".to_string()].into();
         let observed = apply_probe_events(
             &store,
@@ -1704,7 +1783,69 @@ mod tests {
         .await;
 
         assert!(observed);
-        assert_eq!(stored_record(&store).await.outcome(), Outcome::Complete);
+        let stored = stored_record(&store).await;
+        assert_eq!(stored.outcome(), Outcome::Complete);
+        assert_eq!(stored.witness_ms, None);
+        let proof = stored.proofs.first().expect("one proof");
+        assert_eq!(proof.queue_ms, None);
+        assert_eq!(proof.prove_ms, None);
+        assert_eq!(proof.resolution_source, Some(ResolutionSource::Reconciled));
+    }
+
+    #[tokio::test]
+    async fn live_completion_persists_event_stage_timings_and_source() {
+        let store = memory_store();
+        let record = sent_record(1_000);
+        store.record(record.clone()).await.expect("record");
+
+        record_completion(
+            &store,
+            &span_registry(),
+            &record.new_payload_request_root,
+            "reth-zisk",
+            TerminalMetadata {
+                source: ResolutionSource::Live,
+                witness_ms: Some(1_500),
+                queue_ms: Some(45_000),
+                prove_ms: Some(8_000),
+            },
+        )
+        .await
+        .expect("record completion")
+        .expect("proof transitioned");
+
+        let stored = stored_record(&store).await;
+        assert_eq!(stored.witness_ms, Some(1_500));
+        let proof = stored.proofs.first().expect("one proof");
+        assert_eq!(proof.queue_ms, Some(45_000));
+        assert_eq!(proof.prove_ms, Some(8_000));
+        assert_eq!(proof.resolution_source, Some(ResolutionSource::Live));
+    }
+
+    #[test]
+    fn completion_metric_labels_live_and_reconciled_sources() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .set_buckets(&[12.0])
+            .expect("configure buckets")
+            .build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            observe_completion_duration("reth-zisk", ResolutionSource::Live, 1_000);
+            observe_completion_duration("reth-zisk", ResolutionSource::Reconciled, 2_000);
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains(r#"proof_type="reth-zisk",source="live""#))
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains(r#"proof_type="reth-zisk",source="reconciled""#))
+        );
     }
 
     #[tokio::test]
@@ -1737,6 +1878,10 @@ mod tests {
         assert_eq!(proof.stage, Some(FailureStage::Proving));
         assert_eq!(proof.reason.as_deref(), Some("ProvingError"));
         assert_eq!(proof.error.as_deref(), Some("proving exploded"));
+        assert_eq!(stored.witness_ms, Some(12_000));
+        assert_eq!(proof.queue_ms, None);
+        assert_eq!(proof.prove_ms, None);
+        assert_eq!(proof.resolution_source, Some(ResolutionSource::Reconciled));
     }
 
     #[tokio::test]
@@ -1746,13 +1891,9 @@ mod tests {
         store.record(record.clone()).await.expect("record");
 
         let root: Hash256 = record.new_payload_request_root.parse().expect("valid root");
-        let proof_type = zkboost::parse_proof_type("reth-zisk").expect("valid proof type");
         let replay = futures::stream::iter(vec![
             Ok(proof_failure(root, "stale retry failure")),
-            Ok(ProofEvent::ProofComplete(ProofComplete {
-                new_payload_request_root: root,
-                proof_type,
-            })),
+            Ok(proof_complete(root)),
         ]);
         let pending: HashSet<String> = ["reth-zisk".to_string()].into();
         let observed = apply_probe_events(
@@ -1771,6 +1912,7 @@ mod tests {
         let proof = stored.proofs.first().expect("one proof");
         assert_eq!(proof.reason, None);
         assert_eq!(proof.error, None);
+        assert_eq!(proof.resolution_source, Some(ResolutionSource::Reconciled));
     }
 
     #[tokio::test]
@@ -1810,6 +1952,7 @@ mod tests {
                 "reth-zisk",
                 Outcome::Complete,
                 None,
+                live_metadata(),
             )
             .await
             .expect("resolve proof")
@@ -1824,10 +1967,7 @@ mod tests {
 
         // A replayed completion for the already-resolved proof changes nothing.
         let root: Hash256 = record.new_payload_request_root.parse().expect("valid root");
-        let replay = futures::stream::iter(vec![Ok(ProofEvent::ProofComplete(ProofComplete {
-            new_payload_request_root: root,
-            proof_type: zkboost::parse_proof_type("reth-zisk").expect("valid proof type"),
-        }))]);
+        let replay = futures::stream::iter(vec![Ok(proof_complete(root))]);
         let pending: HashSet<String> = ["reth-zisk".to_string()].into();
         let observed = apply_probe_events(
             &store,
@@ -1876,6 +2016,7 @@ mod tests {
                     reason: UNRESOLVED_REASON.to_owned(),
                     error: "silent past the cutoff".to_owned(),
                 }),
+                TerminalMetadata::without_timings(ResolutionSource::Reconciled),
             )
             .await
             .expect("resolve proof")
@@ -1890,6 +2031,7 @@ mod tests {
             &span_registry(),
             &record.new_payload_request_root,
             "reth-zisk",
+            live_metadata(),
         )
         .await
         .expect("record completion");
@@ -2074,7 +2216,8 @@ mod tests {
     }
 
     /// With an exporter installed, the `prove_block` span exports carrying the
-    /// slot, block root, and recorded outcome, and its trace id is captured.
+    /// slot, block root, and recorded outcome, and stays open until terminal
+    /// resolution rather than ending at the earlier submission exit.
     #[cfg(feature = "otel")]
     #[tokio::test]
     async fn prove_block_span_exports_with_slot_and_block_root() {
@@ -2100,8 +2243,23 @@ mod tests {
             tracing::callsite::rebuild_interest_cache();
             let span = prove_block_span(123, "0xbeacon");
             let trace_id = current_trace_id(&span);
-            span.record("outcome", "complete");
+            let spans = span_registry();
+            {
+                let _entered = span.enter();
+            }
+            register_span(&spans, "0xroot".to_string(), span.clone());
             drop(span);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            finish_block_span(
+                &spans,
+                "0xroot",
+                &ProofResolution {
+                    duration_ms: 25,
+                    slot: 123,
+                    block_outcome: Outcome::Complete,
+                    block_resolved: true,
+                },
+            );
 
             provider.force_flush().expect("flush spans");
             let spans = exporter.get_finished_spans().expect("finished spans");
@@ -2122,6 +2280,14 @@ mod tests {
         assert_eq!(attr("slot").as_deref(), Some("123"));
         assert_eq!(attr("block_root").as_deref(), Some("0xbeacon"));
         assert_eq!(attr("outcome").as_deref(), Some("complete"));
+        assert!(
+            span_data
+                .end_time
+                .duration_since(span_data.start_time)
+                .expect("span end follows start")
+                >= Duration::from_millis(20),
+            "prove_block must stay open until terminal resolution"
+        );
         // The captured trace id is the exported span's, so the record links
         // to exactly this trace.
         assert_eq!(

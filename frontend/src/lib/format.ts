@@ -43,7 +43,7 @@ export const resolvedAtMs = (r: BlockRecord): number | null => {
 
 export const prepMs = (r: BlockRecord) => requestedAtMs(r) - r.observed_at_ms
 
-export const provingMs = (r: BlockRecord): number | null => {
+export const turnaroundMs = (r: BlockRecord): number | null => {
   const resolved = resolvedAtMs(r)
   return resolved === null ? null : resolved - requestedAtMs(r)
 }
@@ -57,18 +57,31 @@ export const e2eMs = (r: BlockRecord): number | null => {
 export const proofDurationMs = (p: ProofRecord): number | null =>
   p.resolved_at_ms === null ? null : p.resolved_at_ms - p.requested_at_ms
 
+const maxKnownStage = (values: (number | null)[]): number | null => {
+  const known = values.filter((value): value is number => value !== null)
+  return known.length === values.length && known.length ? Math.max(...known) : null
+}
+
+/** Longest per-proof queue wait, present only when every proof reports it. */
+export const queueMs = (r: BlockRecord): number | null =>
+  maxKnownStage(r.proofs.map((proof) => proof.queue_ms))
+
+/** Longest per-proof generation time, present only when every proof reports it. */
+export const proveMs = (r: BlockRecord): number | null =>
+  maxKnownStage(r.proofs.map((proof) => proof.prove_ms))
+
 export const fmt = (ms: number | null) => (ms === null ? '—' : `${ms} ms`)
 
 export const shortRoot = (h: string) => `${h.slice(0, 8)}…${h.slice(-6)}`
 
 /**
- * Split a resolved block into prep% + proving%, summing to 100% of its own
+ * Split a resolved block into prep% + turnaround%, summing to 100% of its own
  * end-to-end. Bars built from this fill their track exactly, so the inline bar
- * reads as a prep:proving ratio while magnitude lives in the numeric columns.
+ * reads as a prep:turnaround ratio while magnitude lives in the numeric columns.
  */
 export const splitPct = (r: BlockRecord) => {
   const e = Math.max(1, e2eMs(r) ?? 1)
-  return { prep: (prepMs(r) / e) * 100, proving: ((provingMs(r) ?? 0) / e) * 100 }
+  return { prep: (prepMs(r) / e) * 100, turnaround: ((turnaroundMs(r) ?? 0) / e) * 100 }
 }
 
 export interface Domain {
@@ -125,20 +138,20 @@ export const buildCadence = (blocks: BlockRecord[], limit: number): Cell[] => {
   return cells
 }
 
-export interface ProvingStats {
+export interface TurnaroundStats {
   fastest: BlockRecord
   slowest: BlockRecord
   median: number
 }
 
-/** Fastest, median, and slowest proving times across all completed blocks. */
-export const provingStats = (blocks: BlockRecord[]): ProvingStats | null => {
+/** Fastest, median, and slowest submit-to-terminal turnaround times. */
+export const turnaroundStats = (blocks: BlockRecord[]): TurnaroundStats | null => {
   const done = blocks.filter((b) => outcome(b) === 'complete')
   if (!done.length) return null
-  const sorted = [...done].sort((a, b) => provingMs(a)! - provingMs(b)!)
+  const sorted = [...done].sort((a, b) => turnaroundMs(a)! - turnaroundMs(b)!)
   return {
     fastest: sorted[0],
     slowest: sorted[sorted.length - 1],
-    median: provingMs(sorted[Math.floor(sorted.length / 2)])!,
+    median: turnaroundMs(sorted[Math.floor(sorted.length / 2)])!,
   }
 }

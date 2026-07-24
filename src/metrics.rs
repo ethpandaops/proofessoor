@@ -7,7 +7,7 @@
 
 use ::metrics::{Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge};
 use anyhow::{Context, Result};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 /// Total non-optimistic blocks observed.
 pub const BLOCKS_OBSERVED: &str = "proofessoor_blocks_observed_total";
@@ -45,15 +45,22 @@ pub const STORE_BYTES: &str = "proofessoor_store_bytes";
 pub const STORE_EVICTIONS: &str = "proofessoor_store_evictions_total";
 /// Time spent fetching, building, and submitting a request.
 pub const REQUEST_DURATION: &str = "proofessoor_proof_request_duration_seconds";
-/// Per-stage time within the request path (labeled by stage: fetch, ssz_decode, build, submit).
+/// Per-stage time within the request path (labeled by stage: fetch, build, submit, verify).
 pub const REQUEST_STAGE_DURATION: &str = "proofessoor_request_stage_duration_seconds";
-/// Time from request submission to proof completion (labeled by proof_type).
+/// Time from request submission to proof completion (labeled by proof_type and source).
 pub const COMPLETION_DURATION: &str = "proofessoor_proof_completion_duration_seconds";
 
 /// Histogram buckets in seconds, spanning sub-millisecond CPU work to multi-minute proving.
 const DURATION_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
     120.0, 300.0,
+];
+
+/// Completion buckets resolve every half-second of Ethereum's 12-second slot
+/// budget, while retaining a long tail through the reconciliation cutoff.
+const COMPLETION_BUCKETS: &[f64] = &[
+    0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5,
+    10.0, 10.5, 11.0, 11.5, 12.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0,
 ];
 
 /// Installs the Prometheus recorder, returning a handle for rendering `/metrics`.
@@ -64,6 +71,11 @@ pub fn install() -> Result<PrometheusHandle> {
     let handle = PrometheusBuilder::new()
         .set_buckets(DURATION_BUCKETS)
         .context("failed to configure metric buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full(COMPLETION_DURATION.to_owned()),
+            COMPLETION_BUCKETS,
+        )
+        .context("failed to configure proof-completion metric buckets")?
         .install_recorder()
         .context("failed to install the Prometheus recorder")?;
     register();
@@ -143,4 +155,22 @@ fn register() {
     gauge!(HEAD_LAG).set(0.0);
     gauge!(STORE_RECORDS).set(0.0);
     gauge!(STORE_BYTES).set(0.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_buckets_resolve_the_slot_budget_and_keep_the_reconcile_tail() {
+        let (slot_budget, tail) = COMPLETION_BUCKETS.split_at(24);
+        assert!(
+            slot_budget
+                .iter()
+                .copied()
+                .zip(1_u32..=24)
+                .all(|(bucket, step)| bucket == f64::from(step) * 0.5)
+        );
+        assert_eq!(tail, [15.0, 30.0, 60.0, 120.0, 300.0, 900.0]);
+    }
 }

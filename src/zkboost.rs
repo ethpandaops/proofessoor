@@ -183,7 +183,8 @@ impl Client {
                 ProofEvent::ProofComplete(complete) => {
                     tracing::info!(%root, proof_type = %complete.proof_type, "proof complete");
                     if artifacts.needs_proof_bytes() {
-                        self.collect_artifacts(root, complete.proof_type, chain_config, artifacts)
+                        let _verification_duration = self
+                            .collect_artifacts(root, complete.proof_type, chain_config, artifacts)
                             .await?;
                     }
                 }
@@ -217,16 +218,17 @@ impl Client {
         proof_type: ProofType,
         chain_config: Option<&ChainConfig>,
         artifacts: &Artifacts,
-    ) -> Result<()> {
+    ) -> Result<Option<Duration>> {
         let proof = self
             .inner
             .get_proof(root, proof_type)
             .await
             .context("failed to download proof bytes")?;
 
-        if artifacts.verify {
+        let verification_duration = if artifacts.verify {
             let chain_config = chain_config
                 .context("cannot verify: no chain config resolved for the proof's block")?;
+            let start = std::time::Instant::now();
             let response = self
                 .inner
                 .verify_proof(root, chain_config, proof_type, &proof)
@@ -236,7 +238,10 @@ impl Client {
                 bail!("proof for {proof_type} failed verification");
             }
             tracing::info!(%root, %proof_type, "proof verified");
-        }
+            Some(start.elapsed())
+        } else {
+            None
+        };
 
         if artifacts.saves() {
             let dir = artifacts.out_dir();
@@ -250,7 +255,7 @@ impl Client {
             tracing::info!(%root, %proof_type, path = %path.display(), bytes = proof.len(), "proof saved");
         }
 
-        Ok(())
+        Ok(verification_duration)
     }
 
     /// Fetches the proof types advertised by the server (`GET /v1/proof_types`).

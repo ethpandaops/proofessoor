@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { BlockRecord, StatusSummary } from '../lib/types'
-  import { barHeight, buildCadence, e2eDomain, fmt, outcome, provingMs, provingStats, splitPct } from '../lib/format'
+  import { barHeight, buildCadence, e2eDomain, fmt, outcome, splitPct, turnaroundMs, turnaroundStats } from '../lib/format'
   import Tooltip from './Tooltip.svelte'
 
   let {
@@ -24,26 +24,26 @@
   const visible = $derived(cells.slice(-capacity))
   const visibleBlocks = $derived(visible.flatMap((c) => (c.kind === 'block' ? [c.r] : [])))
   const domain = $derived(e2eDomain(visibleBlocks))
-  const stats = $derived(provingStats(blocks))
+  const stats = $derived(turnaroundStats(blocks))
 </script>
 
 <section class="rounded-xl border border-line bg-slate/60 p-5">
   <div class="flex items-baseline justify-between gap-4">
     <h2 class="flex items-baseline gap-2 text-[11px]/4 font-semibold tracking-widest text-chalk/50 uppercase">
-      Proving cadence
+      Request cadence
       <span class="text-[10px]/4 tracking-normal text-chalk/30 normal-case">recent {capacity}</span>
     </h2>
     <p class="mono flex flex-wrap items-baseline gap-x-2 text-xs/4 text-chalk/55">
       {#if stats}
         {@const fastest = stats.fastest}
         {@const slowest = stats.slowest}
-        <span class="text-chalk/35">all {summary?.total ?? 0} · proving</span>
+        <span class="text-chalk/35">all {summary?.total ?? 0} · turnaround</span>
         <Tooltip text="slot {fastest.slot} — fastest">
           <button
             type="button"
             onclick={() => onSelect(fastest)}
             class="underline decoration-dotted underline-offset-2 transition-colors hover:text-chalk"
-            >min {fmt(provingMs(fastest))}</button
+            >min {fmt(turnaroundMs(fastest))}</button
           >
         </Tooltip>
         <span class="text-chalk/30">·</span>
@@ -54,7 +54,7 @@
             type="button"
             onclick={() => onSelect(slowest)}
             class="underline decoration-dotted underline-offset-2 transition-colors hover:text-chalk"
-            >max {fmt(provingMs(slowest))}</button
+            >max {fmt(turnaroundMs(slowest))}</button
           >
         </Tooltip>
         <span class="text-chalk/30">·</span>
@@ -85,7 +85,7 @@
           {:else if o === 'sent'}
             <div class="size-full animate-pulse bg-gold/70"></div>
           {:else}
-            <div class="w-full bg-spark" style="height: {s.proving}%"></div>
+            <div class="w-full bg-spark" style="height: {s.turnaround}%"></div>
             <div class="w-full bg-violet" style="height: {s.prep}%"></div>
           {/if}
         </button>
@@ -98,7 +98,7 @@
 
   <div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]/4 text-chalk/45">
     <span class="flex items-center gap-1.5"><span class="size-2 rounded-xs bg-violet"></span> prep</span>
-    <span class="flex items-center gap-1.5"><span class="size-2 rounded-xs bg-spark"></span> proving</span>
+    <span class="flex items-center gap-1.5"><span class="size-2 rounded-xs bg-spark"></span> turnaround</span>
     <span class="flex items-center gap-1.5"><span class="size-2 rounded-xs bg-ember"></span> failed</span>
     <span class="flex items-center gap-1.5"><span class="size-2 rounded-xs bg-gold"></span> in-flight</span>
     <Tooltip

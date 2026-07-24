@@ -6,6 +6,9 @@ export type Outcome = 'sent' | 'complete' | 'failed'
 /** Which side a failure occurred on. */
 export type FailureStage = 'submit' | 'proving'
 
+/** How proofessoor learned the terminal outcome. */
+export type ResolutionSource = 'live' | 'reconciled'
+
 /** Status of one requested proof (one proof type) for a block. */
 export interface ProofRecord {
   /** Proof type requested (e.g. reth-zisk). */
@@ -19,10 +22,12 @@ export interface ProofRecord {
   error: string | null
   requested_at_ms: number
   resolved_at_ms: number | null
-  /** Queue time inside zkBoost; not exposed by current proof events. */
+  /** Queue time inside zkBoost. */
   queue_ms: number | null
-  /** Pure proving time inside zkBoost; not exposed by current proof events. */
+  /** Proof-generation time inside zkBoost, after leaving its queue. */
   prove_ms: number | null
+  /** Whether the terminal outcome arrived live or through reconciliation. */
+  resolution_source: ResolutionSource | null
   /** 1-based attempt number; always 1 until submit retries exist. */
   attempt: number
 }
@@ -42,7 +47,7 @@ export interface BlockRecord {
   observed_at_ms: number
   /** OpenTelemetry trace id, when tracing was enabled and sampled. */
   trace_id: string | null
-  /** Witness-generation time; not exposed by current proof events. */
+  /** Witness-generation time reported by zkBoost. */
   witness_ms: number | null
   proofs: ProofRecord[]
 }
@@ -53,4 +58,8 @@ export interface StatusSummary {
   complete: number
   failed: number
   latest_slot: number | null
+}
+
+export interface DashboardConfig {
+  grafana_url: string | null
 }

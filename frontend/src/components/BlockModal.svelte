@@ -1,8 +1,13 @@
 <script lang="ts">
   import type { BlockRecord } from '../lib/types'
-  import { e2eMs, failureReason, fmt, outcome, prepMs, proofDurationMs, proofTypes, provingMs } from '../lib/format'
+  import { tempoTraceUrl } from '../lib/api'
+  import { e2eMs, failureReason, fmt, outcome, prepMs, proofDurationMs, proofTypes, turnaroundMs } from '../lib/format'
 
-  let { record, onClose }: { record: BlockRecord; onClose: () => void } = $props()
+  let {
+    record,
+    grafanaUrl,
+    onClose,
+  }: { record: BlockRecord; grafanaUrl: string | null; onClose: () => void } = $props()
 
   async function copy(text: string) {
     try {
@@ -45,6 +50,29 @@
       >
     </div>
 
+    <!-- Stage timing reported by zkBoost. Missing values stay explicitly unknown. -->
+    <div class="mt-5">
+      <p class="text-[11px]/4 text-chalk/40 uppercase">zkBoost stages</p>
+      <div class="mono mt-2 flex flex-col gap-1.5 text-xs/5">
+        <div class="flex items-center justify-between rounded-md border border-line bg-ink px-3 py-2">
+          <span class="text-chalk/55">witness</span>
+          <span>{fmt(record.witness_ms)}</span>
+        </div>
+        {#each record.proofs as proof (proof.proof_type)}
+          <div class="flex flex-col gap-1 rounded-md border border-line bg-ink px-3 py-2">
+            <div class="flex items-center justify-between gap-4">
+              <span class="text-chalk/55">queue · {proof.proof_type}</span>
+              <span>{fmt(proof.queue_ms)}</span>
+            </div>
+            <div class="flex items-center justify-between gap-4">
+              <span class="text-chalk/55">generation · {proof.proof_type}</span>
+              <span>{fmt(proof.prove_ms)}</span>
+            </div>
+          </div>
+        {/each}
+      </div>
+    </div>
+
     <div class="mt-5 grid grid-cols-2 gap-4 text-sm/6">
       <div>
         <p class="text-[11px]/4 text-chalk/40 uppercase">execution block</p>
@@ -84,6 +112,13 @@
             {:else}
               <span class="rounded-md bg-gold/12 px-2 py-0.5 text-gold">in-flight</span>
             {/if}
+            {#if proof.resolution_source}
+              <span
+                title="How proofessoor learned this terminal outcome"
+                class="rounded-md bg-chalk/10 px-2 py-0.5 text-chalk/55"
+                >source · {proof.resolution_source}</span
+              >
+            {/if}
             <span class="ml-auto text-chalk/55">{fmt(proofDurationMs(proof))}</span>
           </div>
         {/each}
@@ -116,7 +151,7 @@
       <div class="mono mt-2 flex items-center gap-2 text-xs/5">
         <span class="rounded-md bg-violet/15 px-2 py-1 text-violet">prep {fmt(prepMs(record))}</span>
         <span class="text-chalk/30">→</span>
-        <span class="rounded-md bg-spark/15 px-2 py-1 text-spark">proving {fmt(provingMs(record))}</span>
+        <span class="rounded-md bg-spark/15 px-2 py-1 text-spark">turnaround {fmt(turnaroundMs(record))}</span>
         <span class="text-chalk/30">=</span>
         <span class="rounded-md bg-chalk/10 px-2 py-1">end-to-end {fmt(e2eMs(record))}</span>
       </div>
@@ -137,5 +172,28 @@
         </div>
       {/each}
     </div>
+
+    {#if record.trace_id}
+      <div class="mt-5">
+        <p class="text-[11px]/4 text-chalk/40 uppercase">trace id</p>
+        {#if grafanaUrl}
+          <a
+            href={tempoTraceUrl(grafanaUrl, record.trace_id)}
+            target="_blank"
+            rel="noreferrer"
+            class="mono mt-1 block w-full truncate rounded-md border border-line bg-ink px-3 py-2 text-xs/5 text-violet hover:text-chalk"
+            >{record.trace_id}</a
+          >
+        {:else}
+          <button
+            type="button"
+            onclick={() => copy(record.trace_id ?? '')}
+            title="copy"
+            class="mono mt-1 w-full truncate rounded-md border border-line bg-ink px-3 py-2 text-left text-xs/5 text-chalk/70 hover:text-chalk"
+            >{record.trace_id}</button
+          >
+        {/if}
+      </div>
+    {/if}
   </div>
 </div>

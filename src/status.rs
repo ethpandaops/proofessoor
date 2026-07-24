@@ -67,6 +67,51 @@ pub enum FailureStage {
     Proving,
 }
 
+/// How proofessoor learned a proof's terminal outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionSource {
+    /// Observed on the continuously running zkBoost proof-event stream.
+    Live,
+    /// Recovered by a root-specific reconciliation probe.
+    Reconciled,
+}
+
+impl ResolutionSource {
+    /// The lowercase wire and metric-label name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Reconciled => "reconciled",
+        }
+    }
+}
+
+/// Metadata carried by the event that resolves a proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalMetadata {
+    /// Whether the outcome arrived live or through reconciliation.
+    pub source: ResolutionSource,
+    /// Time spent obtaining the execution witness.
+    pub witness_ms: Option<u64>,
+    /// Time spent waiting in zkBoost's proof worker queue.
+    pub queue_ms: Option<u64>,
+    /// Time spent proving after worker dequeue.
+    pub prove_ms: Option<u64>,
+}
+
+impl TerminalMetadata {
+    /// Metadata for an event whose stage timings are unavailable.
+    pub const fn without_timings(source: ResolutionSource) -> Self {
+        Self {
+            source,
+            witness_ms: None,
+            queue_ms: None,
+            prove_ms: None,
+        }
+    }
+}
+
 /// Structured detail for a failed proof, recorded for display and debugging.
 ///
 /// `reason` is the low-cardinality category safe to use as a metric label;
@@ -112,6 +157,9 @@ pub struct ProofRecord {
     /// event recording must populate this field.
     #[serde(default)]
     pub prove_ms: Option<u64>,
+    /// Whether the terminal outcome arrived live or through reconciliation.
+    #[serde(default)]
+    pub resolution_source: Option<ResolutionSource>,
     /// 1-based attempt number. Stream mode records attempt 1 because it does not
     /// retry submissions. A retry path must increment this value for each
     /// resubmission while preserving the terminal-outcome invariant.
@@ -137,6 +185,7 @@ impl ProofRecord {
             resolved_at_ms: None,
             queue_ms: None,
             prove_ms: None,
+            resolution_source: None,
             attempt: 1,
         }
     }
@@ -266,6 +315,16 @@ impl BlockRecord {
             .map(|resolved| resolved.saturating_sub(self.observed_at_ms))
     }
 
+    /// Longest per-proof queue wait, present only when every proof reports it.
+    pub fn queue_ms(&self) -> Option<u64> {
+        max_known_duration(self.proofs.iter().map(|proof| proof.queue_ms))
+    }
+
+    /// Longest per-proof proving time, present only when every proof reports it.
+    pub fn prove_ms(&self) -> Option<u64> {
+        max_known_duration(self.proofs.iter().map(|proof| proof.prove_ms))
+    }
+
     /// The first failed proof's failure category, if any proof failed.
     pub fn failure_reason(&self) -> Option<&str> {
         self.proofs
@@ -363,6 +422,9 @@ pub enum RecordSort {
     PrepMs,
     ProvingMs,
     TotalMs,
+    WitnessMs,
+    QueueMs,
+    ProveMs,
 }
 
 impl RecordSort {
@@ -373,6 +435,9 @@ impl RecordSort {
             Self::PrepMs => "prep_ms",
             Self::ProvingMs => "proving_ms",
             Self::TotalMs => "total_ms",
+            Self::WitnessMs => "witness_ms",
+            Self::QueueMs => "queue_ms",
+            Self::ProveMs => "prove_ms",
         }
     }
 
@@ -383,6 +448,9 @@ impl RecordSort {
             "prep_ms" => Some(Self::PrepMs),
             "proving_ms" => Some(Self::ProvingMs),
             "total_ms" => Some(Self::TotalMs),
+            "witness_ms" => Some(Self::WitnessMs),
+            "queue_ms" => Some(Self::QueueMs),
+            "prove_ms" => Some(Self::ProveMs),
             _ => None,
         }
     }
@@ -393,6 +461,9 @@ impl RecordSort {
             Self::PrepMs => Some(record.prep_ms()),
             Self::ProvingMs => record.completion_ms(),
             Self::TotalMs => record.end_to_end_ms(),
+            Self::WitnessMs => record.witness_ms,
+            Self::QueueMs => record.queue_ms(),
+            Self::ProveMs => record.prove_ms(),
         }
     }
 }
@@ -453,6 +524,18 @@ pub struct RecordQuery {
     pub min_total_ms: Option<u64>,
     /// Inclusive maximum discovery-to-resolution duration.
     pub max_total_ms: Option<u64>,
+    /// Inclusive minimum execution-witness duration.
+    pub min_witness_ms: Option<u64>,
+    /// Inclusive maximum execution-witness duration.
+    pub max_witness_ms: Option<u64>,
+    /// Inclusive minimum worker-queue duration.
+    pub min_queue_ms: Option<u64>,
+    /// Inclusive maximum worker-queue duration.
+    pub max_queue_ms: Option<u64>,
+    /// Inclusive minimum proof-generation duration.
+    pub min_prove_ms: Option<u64>,
+    /// Inclusive maximum proof-generation duration.
+    pub max_prove_ms: Option<u64>,
     /// Field used to order matching requests.
     pub sort: RecordSort,
     /// Direction used to order the selected field.
@@ -461,11 +544,17 @@ pub struct RecordQuery {
 
 impl RecordQuery {
     fn requires_proof_aggregation(&self) -> bool {
-        matches!(self.sort, RecordSort::ProvingMs | RecordSort::TotalMs)
-            || self.min_proving_ms.is_some()
+        matches!(
+            self.sort,
+            RecordSort::ProvingMs | RecordSort::TotalMs | RecordSort::QueueMs | RecordSort::ProveMs
+        ) || self.min_proving_ms.is_some()
             || self.max_proving_ms.is_some()
             || self.min_total_ms.is_some()
             || self.max_total_ms.is_some()
+            || self.min_queue_ms.is_some()
+            || self.max_queue_ms.is_some()
+            || self.min_prove_ms.is_some()
+            || self.max_prove_ms.is_some()
     }
 
     fn matches(&self, record: &BlockRecord) -> bool {
@@ -481,6 +570,9 @@ impl RecordQuery {
                 self.max_proving_ms,
             )
             && optional_within_bounds(record.end_to_end_ms(), self.min_total_ms, self.max_total_ms)
+            && optional_within_bounds(record.witness_ms, self.min_witness_ms, self.max_witness_ms)
+            && optional_within_bounds(record.queue_ms(), self.min_queue_ms, self.max_queue_ms)
+            && optional_within_bounds(record.prove_ms(), self.min_prove_ms, self.max_prove_ms)
     }
 
     fn cursor_for(&self, record: &BlockRecord) -> RecordCursor {
@@ -603,6 +695,7 @@ pub trait StatusStore: Send + Sync {
         proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
+        metadata: TerminalMetadata,
     ) -> Result<ResolveOutcome>;
 
     /// The highest slot recorded so far, if any.
@@ -688,6 +781,7 @@ impl State {
         proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
+        metadata: TerminalMetadata,
     ) -> ResolveOutcome {
         let Some(record) = self.records.get_mut(root) else {
             return ResolveOutcome::Unknown;
@@ -707,6 +801,9 @@ impl State {
             return ResolveOutcome::AlreadyResolved(proof.outcome);
         }
         let now = now_ms();
+        if record.witness_ms.is_none() {
+            record.witness_ms = metadata.witness_ms;
+        }
         proof.outcome = outcome;
         if let Some(failure) = failure {
             proof.stage = Some(failure.stage);
@@ -714,6 +811,9 @@ impl State {
             proof.error = Some(failure.error);
         }
         proof.resolved_at_ms = Some(now);
+        proof.queue_ms = metadata.queue_ms;
+        proof.prove_ms = metadata.prove_ms;
+        proof.resolution_source = Some(metadata.source);
         let duration_ms = now.saturating_sub(proof.requested_at_ms);
         ResolveOutcome::Transitioned(ProofResolution {
             duration_ms,
@@ -833,12 +933,13 @@ impl StatusStore for MemoryStatusStore {
         proof_type: &str,
         outcome: Outcome,
         failure: Option<Failure>,
+        metadata: TerminalMetadata,
     ) -> Result<ResolveOutcome> {
         Ok(self
             .state
             .lock()
             .await
-            .resolve_proof(root, proof_type, outcome, failure))
+            .resolve_proof(root, proof_type, outcome, failure, metadata))
     }
 
     async fn latest_slot(&self) -> Result<Option<u64>> {
@@ -958,6 +1059,15 @@ fn optional_within_bounds(value: Option<u64>, min: Option<u64>, max: Option<u64>
         Some(value) => within_bounds(value, min, max),
         None => min.is_none() && max.is_none(),
     }
+}
+
+fn max_known_duration(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    let mut max = None;
+    for value in values {
+        let value = value?;
+        max = Some(max.map_or(value, |current: u64| current.max(value)));
+    }
+    max
 }
 
 fn compare_records(
@@ -1154,6 +1264,10 @@ mod tests {
         }
     }
 
+    const fn live_metadata() -> TerminalMetadata {
+        TerminalMetadata::without_timings(ResolutionSource::Live)
+    }
+
     fn timed_record(
         slot: u64,
         root: &str,
@@ -1182,6 +1296,28 @@ mod tests {
             proof.outcome = outcome;
             proof.resolved_at_ms = resolved_at_ms;
         }
+        record
+    }
+
+    fn stage_record(
+        slot: u64,
+        root: &str,
+        witness_ms: Option<u64>,
+        queue_ms: Option<u64>,
+        prove_ms: Option<u64>,
+    ) -> BlockRecord {
+        let mut record = timed_record(
+            slot,
+            root,
+            &["reth-zisk"],
+            1_000,
+            1_100,
+            &[(Outcome::Complete, Some(1_600))],
+        );
+        record.witness_ms = witness_ms;
+        let proof = record.proofs.first_mut().expect("one proof");
+        proof.queue_ms = queue_ms;
+        proof.prove_ms = prove_ms;
         record
     }
 
@@ -1225,6 +1361,97 @@ mod tests {
         ] {
             store.record(record).await.expect("seed dashboard record");
         }
+    }
+
+    async fn assert_terminal_metadata_persistence(store: &dyn StatusStore) {
+        store
+            .record(record(120, "0xcomplete"))
+            .await
+            .expect("record completion candidate");
+        store
+            .resolve_proof(
+                "0xcomplete",
+                "reth-zisk",
+                Outcome::Complete,
+                None,
+                TerminalMetadata {
+                    source: ResolutionSource::Live,
+                    witness_ms: Some(1_500),
+                    queue_ms: Some(45_000),
+                    prove_ms: Some(8_000),
+                },
+            )
+            .await
+            .expect("resolve completion");
+        assert_eq!(
+            store
+                .resolve_proof(
+                    "0xcomplete",
+                    "reth-zisk",
+                    Outcome::Complete,
+                    None,
+                    TerminalMetadata {
+                        source: ResolutionSource::Reconciled,
+                        witness_ms: Some(9_999),
+                        queue_ms: Some(9_999),
+                        prove_ms: Some(9_999),
+                    },
+                )
+                .await
+                .expect("repeat completion"),
+            ResolveOutcome::AlreadyResolved(Outcome::Complete)
+        );
+
+        store
+            .record(record(121, "0xfailure"))
+            .await
+            .expect("record failure candidate");
+        store
+            .resolve_proof(
+                "0xfailure",
+                "reth-zisk",
+                Outcome::Failed,
+                Some(Failure {
+                    stage: FailureStage::Proving,
+                    reason: "WitnessTimeout".to_string(),
+                    error: "witness timed out".to_string(),
+                }),
+                TerminalMetadata {
+                    source: ResolutionSource::Reconciled,
+                    witness_ms: Some(12_000),
+                    queue_ms: None,
+                    prove_ms: None,
+                },
+            )
+            .await
+            .expect("resolve failure");
+
+        let records = store.records().await.expect("read terminal metadata");
+        let complete = records
+            .iter()
+            .find(|record| record.new_payload_request_root == "0xcomplete")
+            .expect("completed record");
+        assert_eq!(complete.witness_ms, Some(1_500));
+        let complete_proof = complete.proofs.first().expect("completed proof");
+        assert_eq!(complete_proof.queue_ms, Some(45_000));
+        assert_eq!(complete_proof.prove_ms, Some(8_000));
+        assert_eq!(
+            complete_proof.resolution_source,
+            Some(ResolutionSource::Live)
+        );
+
+        let failed = records
+            .iter()
+            .find(|record| record.new_payload_request_root == "0xfailure")
+            .expect("failed record");
+        assert_eq!(failed.witness_ms, Some(12_000));
+        let failed_proof = failed.proofs.first().expect("failed proof");
+        assert_eq!(failed_proof.queue_ms, None);
+        assert_eq!(failed_proof.prove_ms, None);
+        assert_eq!(
+            failed_proof.resolution_source,
+            Some(ResolutionSource::Reconciled)
+        );
     }
 
     fn roots(page: &RecordPage) -> Vec<&str> {
@@ -1374,6 +1601,67 @@ mod tests {
             ),
             vec!["0xb", "0xd", "0xa", "0xc"]
         );
+
+        for record in [
+            stage_record(110, "0xstage-low", Some(100), Some(200), Some(300)),
+            stage_record(111, "0xstage-high", Some(400), Some(500), Some(600)),
+            stage_record(112, "0xstage-unknown", None, None, None),
+        ] {
+            store.record(record).await.expect("seed stage record");
+        }
+
+        let witness = RecordQuery {
+            min_witness_ms: Some(300),
+            max_witness_ms: Some(500),
+            sort: RecordSort::WitnessMs,
+            order: SortOrder::Asc,
+            ..RecordQuery::default()
+        };
+        assert_eq!(
+            roots(
+                &store
+                    .records_page(None, &witness, 100)
+                    .await
+                    .expect("witness page")
+            ),
+            vec!["0xstage-high"]
+        );
+
+        let queue = RecordQuery {
+            min_queue_ms: Some(100),
+            max_queue_ms: Some(300),
+            sort: RecordSort::QueueMs,
+            ..RecordQuery::default()
+        };
+        assert_eq!(
+            roots(
+                &store
+                    .records_page(None, &queue, 100)
+                    .await
+                    .expect("queue page")
+            ),
+            vec!["0xstage-low"]
+        );
+
+        let prove = RecordQuery {
+            sort: RecordSort::ProveMs,
+            order: SortOrder::Asc,
+            ..RecordQuery::default()
+        };
+        let prove_page = store
+            .records_page(None, &prove, 100)
+            .await
+            .expect("prove page");
+        let stage_roots: Vec<&str> = prove_page
+            .records
+            .iter()
+            .filter(|record| record.new_payload_request_root.starts_with("0xstage"))
+            .map(|record| record.new_payload_request_root.as_str())
+            .collect();
+        assert_eq!(
+            stage_roots,
+            vec!["0xstage-low", "0xstage-high", "0xstage-unknown"]
+        );
     }
 
     #[tokio::test]
@@ -1386,6 +1674,20 @@ mod tests {
         let dir = temp_state_dir("sqlite-dashboard-queries");
         let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
         assert_dashboard_queries(&store).await;
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn memory_persists_completion_and_failure_stage_metadata() {
+        assert_terminal_metadata_persistence(&MemoryStatusStore::new(0)).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_persists_completion_and_failure_stage_metadata() {
+        let dir = temp_state_dir("sqlite-terminal-metadata");
+        let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
+        assert_terminal_metadata_persistence(&store).await;
         drop(store);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -1446,7 +1748,13 @@ mod tests {
             .expect("insert request");
         assert_eq!(inserted.outcome, RecordOutcome::Inserted);
         store
-            .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+            .resolve_proof(
+                "0xroot",
+                "reth-zisk",
+                Outcome::Complete,
+                None,
+                live_metadata(),
+            )
             .await
             .expect("complete first proof");
 
@@ -1488,7 +1796,13 @@ mod tests {
             .expect("insert request");
         assert_eq!(inserted.outcome, RecordOutcome::Inserted);
         store
-            .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+            .resolve_proof(
+                "0xroot",
+                "reth-zisk",
+                Outcome::Complete,
+                None,
+                live_metadata(),
+            )
             .await
             .expect("complete first proof");
 
@@ -1580,7 +1894,13 @@ mod tests {
         let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
         store.record(record(200, "0xroot")).await.expect("record");
         store
-            .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+            .resolve_proof(
+                "0xroot",
+                "reth-zisk",
+                Outcome::Complete,
+                None,
+                live_metadata(),
+            )
             .await
             .expect("resolve proof");
         drop(store);
@@ -1829,7 +2149,13 @@ mod tests {
             .await
             .expect("record settled candidate");
         store
-            .resolve_proof("0xsettled", "reth-zisk", Outcome::Complete, None)
+            .resolve_proof(
+                "0xsettled",
+                "reth-zisk",
+                Outcome::Complete,
+                None,
+                live_metadata(),
+            )
             .await
             .expect("settle request");
 
@@ -1956,7 +2282,13 @@ mod tests {
         let store = SqliteStatusStore::open(&dir, 0).await.expect("open");
         store.record(record(250, "0xroot")).await.expect("record");
 
-        let complete = store.resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None);
+        let complete = store.resolve_proof(
+            "0xroot",
+            "reth-zisk",
+            Outcome::Complete,
+            None,
+            live_metadata(),
+        );
         let failed = store.resolve_proof(
             "0xroot",
             "reth-zisk",
@@ -1966,6 +2298,7 @@ mod tests {
                 reason: "ProvingError".to_string(),
                 error: "proof failed".to_string(),
             }),
+            live_metadata(),
         );
         let (complete, failed) = tokio::join!(complete, failed);
         let outcomes = (
@@ -2030,6 +2363,7 @@ mod tests {
                     reason: "ProvingError".to_string(),
                     error: "proof failed".to_string(),
                 }),
+                live_metadata(),
             )
             .await
             .expect("resolve failed proof");
@@ -2087,6 +2421,7 @@ mod tests {
                     reason: "WitnessTimeout".to_string(),
                     error: "witness fetch exceeded 12s".to_string(),
                 }),
+                live_metadata(),
             )
             .await
             .expect("resolve proof");
@@ -2112,7 +2447,13 @@ mod tests {
 
         // First proof completes: the other is still in flight, so the block is too.
         let resolution = store
-            .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+            .resolve_proof(
+                "0xroot",
+                "reth-zisk",
+                Outcome::Complete,
+                None,
+                live_metadata(),
+            )
             .await
             .expect("resolve proof")
             .transitioned()
@@ -2131,6 +2472,7 @@ mod tests {
                     reason: "ProvingError".to_string(),
                     error: "boom".to_string(),
                 }),
+                live_metadata(),
             )
             .await
             .expect("resolve proof")
@@ -2154,14 +2496,26 @@ mod tests {
         // reported as unknown (routine noise, not a discarded late event).
         assert_eq!(
             store
-                .resolve_proof("0xother", "reth-zisk", Outcome::Complete, None)
+                .resolve_proof(
+                    "0xother",
+                    "reth-zisk",
+                    Outcome::Complete,
+                    None,
+                    live_metadata()
+                )
                 .await
                 .expect("resolve proof"),
             ResolveOutcome::Unknown
         );
         assert_eq!(
             store
-                .resolve_proof("0xroot", "ethrex-sp1", Outcome::Complete, None)
+                .resolve_proof(
+                    "0xroot",
+                    "ethrex-sp1",
+                    Outcome::Complete,
+                    None,
+                    live_metadata()
+                )
                 .await
                 .expect("resolve proof"),
             ResolveOutcome::Unknown
@@ -2171,7 +2525,13 @@ mod tests {
         // reports the outcome already recorded.
         assert!(
             store
-                .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+                .resolve_proof(
+                    "0xroot",
+                    "reth-zisk",
+                    Outcome::Complete,
+                    None,
+                    live_metadata()
+                )
                 .await
                 .expect("resolve proof")
                 .transitioned()
@@ -2179,7 +2539,13 @@ mod tests {
         );
         assert_eq!(
             store
-                .resolve_proof("0xroot", "reth-zisk", Outcome::Failed, None)
+                .resolve_proof(
+                    "0xroot",
+                    "reth-zisk",
+                    Outcome::Failed,
+                    None,
+                    live_metadata()
+                )
                 .await
                 .expect("resolve proof"),
             ResolveOutcome::AlreadyResolved(Outcome::Complete)
@@ -2208,6 +2574,7 @@ mod tests {
                     reason: "Unresolved".to_string(),
                     error: "silent past the cutoff".to_string(),
                 }),
+                live_metadata(),
             )
             .await
             .expect("resolve proof");
@@ -2216,7 +2583,13 @@ mod tests {
         // exactly which verdict it contradicts.
         assert_eq!(
             store
-                .resolve_proof("0xroot", "reth-zisk", Outcome::Complete, None)
+                .resolve_proof(
+                    "0xroot",
+                    "reth-zisk",
+                    Outcome::Complete,
+                    None,
+                    live_metadata()
+                )
                 .await
                 .expect("resolve proof"),
             ResolveOutcome::AlreadyResolved(Outcome::Failed)
@@ -2289,6 +2662,7 @@ mod tests {
                     reason: "ProvingError".to_string(),
                     error: "one proof failed while another remains sent".to_string(),
                 }),
+                live_metadata(),
             )
             .await
             .expect("partially resolve old outstanding request");
@@ -2308,7 +2682,13 @@ mod tests {
             .await
             .expect("record settled candidate");
         store
-            .resolve_proof("0xsettled", "reth-zisk", Outcome::Complete, None)
+            .resolve_proof(
+                "0xsettled",
+                "reth-zisk",
+                Outcome::Complete,
+                None,
+                live_metadata(),
+            )
             .await
             .expect("settle request");
 
@@ -2345,7 +2725,7 @@ mod tests {
         assert_eq!(store.inflight_proofs().await.expect("count inflight"), 3);
 
         store
-            .resolve_proof("0xa", "reth-zisk", Outcome::Complete, None)
+            .resolve_proof("0xa", "reth-zisk", Outcome::Complete, None, live_metadata())
             .await
             .expect("resolve proof");
         assert_eq!(store.inflight_proofs().await.expect("count inflight"), 2);
