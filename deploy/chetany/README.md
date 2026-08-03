@@ -22,8 +22,7 @@ Requires DigitalOcean Spaces credentials (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`), a `DIGITALOCEAN_TOKEN` and
 `TF_VAR_cloudflare_api_token` in the environment.
 
-The apply also generates `ansible/inventories/inventory.ini` (gitignored, as
-it contains the droplet IPs).
+The apply also (re)generates `ansible/inventories/inventory.ini`.
 
 ## Ansible
 
