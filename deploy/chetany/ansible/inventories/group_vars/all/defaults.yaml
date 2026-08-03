@@ -1,0 +1,19 @@
+ansible_user: devops
+ansible_python_interpreter: /usr/bin/python3
+
+######################################################
+##
+##          Role specific overwrites
+##
+######################################################
+
+# role: ethpandaops.general.bootstrap
+bootstrap_user: root
+bootstrap_default_user_authorized_keys_github:
+  - barnabasbusa
+  - parithosh
+  - samcm
+  - savid
+  - skylenet
+  - pk910
+  - chetanyb

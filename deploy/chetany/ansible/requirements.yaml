@@ -1,0 +1,7 @@
+roles:
+  - name: gantsign.oh-my-zsh
+    version: "2.4.0"
+collections:
+  - name: ethpandaops.general
+    source: https://github.com/ethpandaops/ansible-collection-general.git,master
+    type: git
