@@ -10,9 +10,14 @@ permissions:
 
 jobs:
   build:
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+      id-token: write # attest, and authenticate to the image mirror
+      attestations: write # attest
     uses: ./.github/workflows/_shared-build.yml
     with:
       ref: ${{ github.sha }}
       tags: '["main","unstable"]'
     secrets:
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      IMAGE_MIRROR_URL: ${{ secrets.IMAGE_MIRROR_URL }}
