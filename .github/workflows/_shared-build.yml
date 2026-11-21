@@ -180,7 +180,6 @@ jobs:
         with:
           tags: ${{ join(fromJSON(inputs.tags), ' ') }}
           digest: ${{ steps.manifest.outputs.digest }}
-          attest-platforms: "false"
           mirror-url: ${{ secrets.IMAGE_MIRROR_URL }}
       # Publish the multi-arch manifest digest so a release can retag it instead
       # of recompiling — this build is cache-free, so the artifact is clean.
