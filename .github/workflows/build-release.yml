@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -53,6 +57,9 @@ jobs:
     permissions:
       contents: read
       actions: read # read the Build Master run and download its digest artifact
+      packages: write # push to ghcr.io
+      id-token: write # attest, and authenticate to the image mirror
+      attestations: write # attest
     steps:
       - name: Wait for the Build Master image of this commit
         id: master
@@ -96,11 +103,13 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - name: Retag the existing digest as the release
+        id: retag
         env:
-          IMAGE: ${{ vars.DOCKER_REPOSITORY || github.repository }}
+          IMAGE: ghcr.io/${{ vars.DOCKER_REPOSITORY || github.repository }}
           TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
           digest=$(cat digest/digest.txt)
@@ -110,6 +119,16 @@ jobs:
           docker buildx imagetools create $tag_args "${IMAGE}@${digest}"
           first=$(echo "$TAGS" | jq -r '.[0]')
           docker buildx imagetools inspect "${IMAGE}:${first}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      # The arch images and the index were attested by Build Master; this job
+      # only retags, so it attests and mirrors the release tags.
+      - name: Attest and mirror to Docker Hub
+        uses: ethpandaops/actions/mirror-image@dab9cb304b6a1dd648e2f1acef6169f7095f515e
+        with:
+          tags: ${{ join(fromJSON(needs.prepare.outputs.tags), ' ') }}
+          digest: ${{ steps.retag.outputs.digest }}
+          attest-platforms: "false"
+          mirror-url: ${{ secrets.IMAGE_MIRROR_URL }}
 
   release:
     needs: [prepare, promote]
