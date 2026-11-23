@@ -16,9 +16,9 @@ jobs:
   build:
     permissions:
       contents: read
-      packages: write # push to ghcr.io
-      id-token: write # attest, and authenticate to the image mirror
-      attestations: write # attest
+      packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/_shared-build.yml
     with:
       ref: ${{ github.sha }}

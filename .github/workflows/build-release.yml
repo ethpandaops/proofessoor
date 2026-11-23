@@ -57,9 +57,9 @@ jobs:
     permissions:
       contents: read
       actions: read # read the Build Master run and download its digest artifact
-      packages: write # push to ghcr.io
-      id-token: write # attest, and authenticate to the image mirror
-      attestations: write # attest
+      packages: write
+      id-token: write
+      attestations: write
     steps:
       - name: Wait for the Build Master image of this commit
         id: master
